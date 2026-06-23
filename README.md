@@ -1,4 +1,4 @@
-# Design and Implementation of an Intelligent Virtual Agent for Advanced Computing Support Ticketing Systems
+# Design and Implementation of an Intelligent Virtual Agent for High Performance Computing Support Ticketing System
 
 This project implements a multimodal Intelligent Virtual Agent (IVA) designed to automate technical support and interactive user assistance within the Kabré supercomputer infrastructure. It bridges the gap between static support repositories and users by combining state-of-the-art natural language understanding, retrieval-augmented reasoning, and a fully rigged 3D avatar within a Unity-based interactive environment.
 
