@@ -1,0 +1,1495 @@
+---
+title: "EDA (Zammad Ticket System)"
+author: "Dylan Benavides"
+date: "2026-06-08"
+output: html_document
+---
+
+# Libraries
+
+```{r, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(lubridate)
+library(tidytext)
+library(tidyverse)
+library(Matrix)
+library(irlba)
+library(stringr)
+library(ggplot2)
+library(text)
+library(reactable)
+library(uwot)
+source("FunctionsSQL.R")
+```
+
+# Data
+
+```{r, warning=FALSE, message=FALSE}
+data <- readLines("zammad_db.sql", warn = FALSE, encoding = "UTF-8")
+length(data)
+str(data)
+```
+
+```{r}
+lineas_tickets <- grep("^INSERT INTO `tickets`", data, value = TRUE)
+lineas_articulos <- grep("^INSERT INTO `ticket_articles`", data, value = TRUE)
+raw_tickets <- extract.records(lineas_tickets[1])
+parsed_tickets <- lapply(raw_tickets, parse.record)
+raw_articles <- unlist(lapply(lineas_articulos, extract.records))
+parsed_articles <- lapply(raw_articles, parse.record)
+cat("Tiquetes individuales extraídos:", length(parsed_tickets), "\n")
+cat("Artículos (mensajes) extraídos:", length(parsed_articles), "\n")
+```
+
+```{r}
+tickets_df <- tibble(
+  ticket_id     = as.integer(sapply(parsed_tickets, `[`, 1)),
+  ticket_number = str_remove_all(sapply(parsed_tickets, `[`, 6), "^'|'$"),
+  title         = str_remove_all(sapply(parsed_tickets, `[`, 7), "^'|'$")
+)
+
+articles_df <- tibble(
+  article_id = as.integer(sapply(parsed_articles, `[`, 1)),
+  ticket_id  = as.integer(sapply(parsed_articles, `[`, 2)),
+  sender_id  = sapply(parsed_articles, `[`, 4),
+  sender     = str_remove_all(sapply(parsed_articles, `[`, 5), "^'|'$"),
+  body       = str_remove_all(sapply(parsed_articles, `[`, 15), "^'|'$"),
+  created_at = str_remove_all(sapply(parsed_articles, `[`, 21), "^'|'$")
+) %>%
+  mutate(
+    created_at = ymd_hms(created_at),
+    body       = str_replace_all(body, "\\\\n|\\\\r", " "),
+    body       = str_squish(body) # Limpia espacios dobles
+  ) %>%
+  # Quitamos los registros vacíos (donde body es NULL)
+  filter(body != "NULL" & !is.na(body))
+
+# 3. Unir ambas tablas para tener el historial completo
+historial_completo <- articles_df %>%
+  left_join(tickets_df, by = "ticket_id") %>%
+  # Ordenar por tiquete y luego por fecha (fundamental para leer la conversación en orden)
+  arrange(ticket_id, created_at) %>% 
+  select(ticket_id, ticket_number, title, article_id, sender_id, sender, created_at, body)
+
+# 4. Ver la estructura final
+cat("Total de mensajes en el historial completo:", nrow(historial_completo), "\n")
+glimpse(historial_completo)
+```
+
+# Dataframe: historial_completo
+
+```{r}
+library(dplyr)
+library(stringr)
+library(textclean)
+
+historial_limpio <- historial_completo %>%
+  mutate(
+    body = body %>%
+      # 1. Limpieza principal con textclean
+      replace_html() %>%          # Destruye <div>, <br>, <span>, etc.
+      replace_url() %>%           # Elimina http:// y https://
+      replace_email() %>%         # Elimina todas las direcciones de correo electrónico
+      
+      # 2. Limpieza de firmas y metadatos de correo (con stringr)
+      str_remove_all("cid:[A-Za-z0-9\\-]+") %>% # Quita rastros de imágenes adjuntas
+      str_remove_all("(?i)el\\s+\\d{1,2}\\s+[a-zñ]+\\.?\\s+\\d{4}.*?escribió:") %>% # Quita citas de correos anteriores
+      
+      # 3. Exclusión explícita de identificadores del personal de soporte e infraestructura
+      str_remove_all("(?i)(kevin zeledón|edward soto|herson mena|soporte de infraestructura)") %>%
+      
+      # 4. Estandarización final (tolower eliminado para preservar mayúsculas para BETO)
+      replace_white()             # Reduce múltiples espacios, \n, \r a un solo espacio
+  ) %>%
+  # 5. Filtrar mensajes que quedaron vacíos o inservibles tras la limpieza
+  filter(nchar(body) > 15)
+```
+
+```{r}
+# Definimos los patrones de los títulos administrativos o de prueba a excluir
+titulos_excluir <- "(?i)(welcome to zammad!|prueba|solicitud usuario nuevo|new registration kabré)"
+
+# Filtramos el dataset
+historial_limpio <- historial_limpio %>%
+  filter(!str_detect(title, titulos_excluir))
+
+# Definimos el patrón ignorando mayúsculas/minúsculas y variaciones de espacios
+patron_comunicado <- "(?i)re:\\s+comunicado\\s+del\\s+supercomputador\\s+kabré:"
+
+# Filtramos el dataset
+historial_limpio <- historial_limpio %>%
+  filter(!str_detect(title, patron_comunicado))
+
+# Definimos los emisores que queremos eliminar (usamos una expresión regular para capturarlos bien)
+emisores_a_excluir <- "(?i)(cluster general|kabre support)\\s*<cluster@cenat\\.ac\\.cr>"
+
+# Aplicamos el filtro
+historial_limpio <- historial_limpio %>%
+  filter(!str_detect(sender, emisores_a_excluir))
+```
+
+```{r}
+# 1. Aseguramos que tenemos los campos necesarios
+historial_secuenciado <- historial_limpio %>%
+  group_by(ticket_id) %>%
+  mutate(orden = row_number()) %>%
+  ungroup()
+
+# 2. Pivotamos usando 'values_from' con múltiples columnas
+tickets_ancho <- historial_secuenciado %>%
+  select(ticket_id, ticket_number, title, orden, body, sender, sender_id) %>%
+  pivot_wider(
+    names_from = orden, 
+    values_from = c(body, sender, sender_id),
+    names_glue = "interaction_{orden}_{.value}"
+  )
+
+# Verificamos la nueva estructura con los emisores
+glimpse(tickets_ancho)
+```
+
+# NLP de tickets_consolidados
+
+Primera interacción
+
+```{r}
+library(dplyr)
+library(tidyselect)
+
+tickets_interaction1 <- tickets_ancho %>%
+  select(
+    ticket_id, 
+    ticket_number, 
+    title,
+    # Incluimos manualmente los campos específicos de la interacción 1
+    interaction_1_body, 
+    interaction_1_sender, 
+    interaction_1_sender_id,
+    # Incluimos todos los otros 'bodies' de interacciones restantes
+    # Usamos matches para traer interaction_2_body hasta interaction_31_body
+    matches("interaction_[2-9]_body$"),
+    matches("interaction_[1-3][0-9]_body$") 
+  ) %>%
+  # Filtramos solo aquellos que tienen un primer mensaje válido
+  filter(!is.na(interaction_1_body))
+
+
+# Verificamos la estructura final
+glimpse(tickets_interaction1)
+```
+
+```{r}
+# Definimos los títulos a excluir
+titulos_a_excluir <- c(
+  "Respuesta automática: Comunicado del Supercomputador Kabré: Recordatorio de respaldo"
+)
+
+# Definimos los emisores a excluir
+emisores_a_excluir <- c(
+  "James Wayne from Xjournals <james@xjournals.com>",
+  "OnDemand Migration for Email <prueba@conare.ac.cr>",
+  "Herson Mena",
+  "Edward Soto"
+)
+
+# Aplicamos el filtro para limpiar el dataset
+tickets_final_clean <- tickets_interaction1 %>%
+  filter(!title %in% titulos_a_excluir) %>%
+  filter(!interaction_1_sender %in% emisores_a_excluir)
+
+glimpse(tickets_final_clean)
+```
+
+```{r}
+library(dplyr)
+library(stringr)
+
+patron_cortesias <- paste0(
+  "(?i)(",
+  "[¡¿]?buen(os)? d[ií]as?|",
+  "[¡¿]?buenas tardes|",
+  "[¡¿]?buenas noches|",
+  "[¡¿]?hola[!\\s,]*|",
+  "[¡¿]?buenas[!\\s,]*|",
+  "(^|[\\s,.:;])d[ií]as(?=\\s|[,\\.:;]|$)|", # <--- Aquí estaba el error, ya corregido a \\.
+  "[¡¿]?espero (que )?(se encuentre|est[eé])[ns]? (muy )?bien|",
+  "[¡¿]?muchas gracias|",
+  "[¡¿]?gracias de antemano|",
+  "[¡¿]?gracias[!\\s]*|",
+  "[¡¿]?agradezco mucho su ayuda|",
+  "[¡¿]?por su ayuda|",
+  "[¡¿]?por favor|",
+  "[¡¿]?please|",
+  "[¡¿]?saludos cordiales|",
+  "[¡¿]?reciban un cordial saludo|",
+  "atentamente|",
+  "cordialmente|",
+  "\\b(saludo|saludos)\\b[!\\s,]*|",
+  "quedo atent[oa]s?|",
+  "quedo a la espera|",
+  "espero sea de utilidad|",
+  "me urge|",
+  "disculpas|",
+  "\\b(chicos?|herson|edward)\\b",
+  ")[!,.:;\\s]*"
+)
+
+patrones_spam_title <- c(
+  "bulk","manufacturer","factory","freight","wall bed","murphy bed",
+  "eyewear","lighting","soap dispenser","lithium","matcha","scooter",
+  "chandelier","makeup","uvc lamp","uvc lamps","led panel",
+  "led bathroom scale","trigger spray","custom clothes",
+  "microfiber cleaning cloth","organic certified","precision casting",
+  "pdcdrill","wall lamp","crystal chandelier","foam soap","lotion pump",
+  "hotel lighting","commercial lighting","new trendy frames",
+  "double your space","organic matcha","industrial lithium",
+  "wall bed mechanism","wall bed hardware","custom led","cosmetic tools",
+  "makeup brushes"
+)
+
+patrones_spam_body <- c(
+  "dear sir","dear manager","best regards","sales manager",
+  "manufacturer","factory","wechat","skype","whatsapp",
+  "made in china","china","shenzhen","kn95","face mask",
+  "uv lamp","uvc lamp","led panel","led lighting","anti-virus",
+  "antivirus led","guardian storm light","ce certified","fda",
+  "medical lighting"
+)
+
+patrones_automaticos <- c(
+  "your request has been received","will be reviewed by our support staff",
+  "zammad helpdesk","customer support system","ticket#",
+  "password reset","request has been received","helpdesk team"
+)
+
+patron_firmas <- regex(
+  "(linkedin:|telegram:|orcid:|tel[eé]fono:|phone:|mobile:|wechat:|skype:|best regards|kind regards|regards|atentamente)[\\s\\S]*$",
+  ignore_case = TRUE
+)
+
+nlp.data_embeddings <- tickets_final_clean %>%
+  mutate(
+    # Mantenemos el texto con sus mayúsculas originales para BETO Cased
+    texto_para_ia = interaction_1_body,
+
+    # HTML
+    texto_para_ia = str_remove_all(texto_para_ia, "<[^>]+>"),
+
+    # Cabeceras de correos
+    texto_para_ia = str_remove_all(
+      texto_para_ia,
+      regex("from:.*|to:.*|cc:.*|bcc:.*|subject:.*", ignore_case = TRUE)
+    ),
+
+    # Forwards
+    texto_para_ia = str_remove_all(
+      texto_para_ia,
+      regex("-----original message-----.*", ignore_case = TRUE, dotall = TRUE)
+    ),
+
+    # Firmas y Cortesías (Ya tienen el ignore_case integrado)
+    texto_para_ia = str_remove(texto_para_ia, patron_firmas),
+    texto_para_ia = str_remove_all(texto_para_ia, patron_cortesias),
+
+    # URLs y Emails (Agregado ignore_case para capturar correos con Mayúsculas)
+    texto_para_ia = str_remove_all(texto_para_ia, regex("https?://\\S+|www\\.\\S+", ignore_case = TRUE)),
+    texto_para_ia = str_remove_all(texto_para_ia, regex("[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}", ignore_case = TRUE)),
+
+    # Rutas Linux (Agregado ignore_case para rutas como /Home/User/Proyecto)
+    texto_para_ia = str_remove_all(texto_para_ia, regex("/[a-z0-9_./\\-]+", ignore_case = TRUE)),
+
+    # IDs numéricos del sistema y Slurm (Ignora mayúsculas en SLURM)
+    texto_para_ia = str_remove_all(texto_para_ia, "\\b\\d{5,}\\b"),
+    texto_para_ia = str_remove_all(texto_para_ia, regex("slurm[-_]?[0-9]+", ignore_case = TRUE)),
+
+    # Secuencias raras y placeholders intermedios
+    texto_para_ia = str_replace_all(texto_para_ia, "\\\\\\'", "'"),
+    texto_para_ia = str_replace_all(texto_para_ia, "numero_id", " "),
+    texto_para_ia = str_replace_all(texto_para_ia, "ruta_servidor", " "),
+
+    # Normalización de espacios en blanco
+    texto_para_ia = str_replace_all(texto_para_ia, "\\s+", " "),
+    texto_para_ia = str_trim(texto_para_ia)
+  ) %>%
+
+  filter(
+    # Filtros de longitud mínima
+    nchar(texto_para_ia) > 20, 
+    str_count(texto_para_ia, "\\S+") >= 4,
+
+    # Exclusión de Spam y elementos administrativos
+    # Nota: Se usa regex(..., ignore_case = TRUE) porque texto_para_ia conserva mayúsculas
+    !str_detect(str_to_lower(title), paste(patrones_spam_title, collapse = "|")),
+    !str_detect(texto_para_ia, regex(paste(patrones_spam_body, collapse = "|"), ignore_case = TRUE)),
+    !str_detect(texto_para_ia, regex(paste(patrones_automaticos, collapse = "|"), ignore_case = TRUE)),
+    !str_detect(str_to_lower(title), "calendario de capacitaciones|test ticket")
+  ) %>%
+
+  distinct(
+    texto_para_ia,
+    .keep_all = TRUE
+  )
+
+```
+
+uno a uno
+
+```{r}
+nlp.data_embeddings$texto_para_ia[1] <- "Consulta sobre disponibilidad del modelo numérico WRF instalado en el cluster para fines de investigación académica."
+nlp.data_embeddings$texto_para_ia[2] <- "Solicitud de asistencia para recuperación de cuenta de usuario por olvido de nombre de usuario y contraseña."
+nlp.data_embeddings$texto_para_ia[3] <- "Consulta técnica sobre procedimiento para instalación y uso de bibliotecas de Python en el cluster, incluyendo carga de módulos y configuración de entornos virtuales con Anaconda."
+nlp.data_embeddings$texto_para_ia[4] <- "Solicitud de aumento de cuota de archivos (inodos) en el cluster debido a la generación de archivos intermedios temporales necesarios para la ejecución de experimentos."
+nlp.data_embeddings$texto_para_ia[5] <- "Consulta técnica sobre comportamiento de Slurm: script ejecutado con --ntasks=3 se repite 3 veces en el output, a pesar de que el código no importa librerías de paralelismo como mpi4py. ¿Es --ntasks=3 la configuración correcta para reservar CPUs o está forzando la ejecución paralela del script?"
+nlp.data_embeddings$texto_para_ia[6] <- "Solicitud de aumento temporal de almacenamiento en cluster para proyecto de genómica (procesamiento de 150 genomas). La capacidad actual es insuficiente para ejecutar análisis conjuntos de filogenia y pangenoma - usuario adumas."
+nlp.data_embeddings$texto_para_ia[7] <- "Solicitud de aumento temporal de cuota de almacenamiento a 200GB para usuario dmurillo. El espacio actual de 100GB es insuficiente para el almacenamiento de modelos de deep learning y datasets de entrenamiento."
+nlp.data_embeddings$texto_para_ia[8] <- "Emergencia técnica: bloqueo de sesión SSH por configuración incorrecta en .bashrc al añadir comando salloc. Solicitud de intervención manual para eliminar la línea en el archivo de configuración del usuario curso-510."
+nlp.data_embeddings$texto_para_ia[9] <- "Consulta de disponibilidad de software: requerimiento de instalación del modelo numérico atmosférico WRF en el cluster."
+nlp.data_embeddings$texto_para_ia[10] <- "Sugerencia de optimización de carga en cola nukwa: solicitar restricción del número de trabajos concurrentes por usuario para mejorar la equidad en el uso de recursos computacionales."
+nlp.data_embeddings$texto_para_ia[11] <- "Consulta sobre disponibilidad y soporte de GPUs en la infraestructura del cluster ante la transición a arquitecturas exaescala."
+
+nlp.data_embeddings$texto_para_ia[12] <- "Solicitud de asignación o aumento de recursos de computación GPU para proyecto de investigación."
+
+nlp.data_embeddings$texto_para_ia[13] <- "Error técnico: imposibilidad de ejecutar el comando 'quast' para análisis de estadísticas de ensamblajes en el cluster."
+
+nlp.data_embeddings$texto_para_ia[14] <- "Solicitud de instalación del depurador 'gdb' para C++ en nodos 'andalan', debido a su ausencia en el PATH actual."
+
+nlp.data_embeddings$texto_para_ia[15] <- "Solicitud de instalación de 'trycycler' como módulo global en cluster para optimizar espacio en /home. Problemas con dependencias de entorno Conda y paquete 'ape' de R en ensamblajes híbridos Illumina-PacBio."
+
+nlp.data_embeddings$texto_para_ia[16] <- "Consulta sobre limitaciones en Slurm: imposibilidad de migrar un trabajo activo en partición 'nu' a 'nu-long' mediante 'scontrol' para extender el tiempo de ejecución."
+
+nlp.data_embeddings$texto_para_ia[17] <- "Solicitud de instalación de versión actualizada de 'GTDBtk' e implementación de base de datos compartida (~65GB) para evitar redundancia de almacenamiento entre múltiples usuarios."
+
+nlp.data_embeddings$texto_para_ia[18] <- "Solicitud de instalación del software bioinformático 'Predector' con sus dependencias (SignalP, Phobious) para uso de investigadores en cluster Kabré."
+
+nlp.data_embeddings$texto_para_ia[19] <- "Solicitud de actualización e instalación de NVIDIA HPC SDK en cluster Kabré, específicamente para uso en nodos 'nukwa'."
+
+nlp.data_embeddings$texto_para_ia[20] <- "Solicitud de aumento de almacenamiento extra (300GB) en cluster para experimentos del proyecto PlantCLEF 2022 - usuario esteban esquivel."
+
+nlp.data_embeddings$texto_para_ia[21] <- "Error en ejecución de pipeline Predector: dependencias faltantes (Phobius, SignalP, TargetP, etc.) y consulta sobre configuración de entorno vía 'module load' vs edición de .bashrc en scripts Slurm."
+
+nlp.data_embeddings$texto_para_ia[22] <- "Solicitud de instalación del comando 'git' en nodos 'andalan', ya que no se encuentra disponible (error 'command not found')."
+
+nlp.data_embeddings$texto_para_ia[23] <- "Error de ejecución en software 'Argos3': error al cargar librería compartida 'libfreeimage.so.3' en sistema operativo CentOS, a pesar de desactivar funciones gráficas."
+
+nlp.data_embeddings$texto_para_ia[24] <- "Error de tiempo de ejecución: 'argos3: error while loading shared libraries: libfreeimage.so.3: cannot open shared object file' en nodos de cálculo."
+
+nlp.data_embeddings$texto_para_ia[25] <- "Solicitud de actualización de 'FastQC' en Kabré a versión 0.11.7 o superior para compatibilidad con datos de secuenciación Illumina NovaSeq."
+
+nlp.data_embeddings$texto_para_ia[26] <- "Error de compilación en 'NVIDIA HPC SDK' (OpenACC): licencia expirada al intentar compilar con 'pgcc'."
+
+nlp.data_embeddings$texto_para_ia[27] <- "Solicitud de instalación de versión de desarrollo de 'FFMPEG' con soporte para librerías 'libavformat', 'libavcodec', 'libavresample' y 'libavutil'."
+
+nlp.data_embeddings$texto_para_ia[28] <- "Solicitud de aumento de cuota de almacenamiento a 1TB para proyecto de investigación en metagenómica (Escuela de Biología, UCR)."
+
+nlp.data_embeddings$texto_para_ia[29] <- "Solicitud de actualización de software bioinformático 'Anvi'o' a la versión 7.1 en el cluster."
+
+nlp.data_embeddings$texto_para_ia[30] <- "Solicitud de creación de 2 cuentas de usuario tipo 'Instructor' para taller de Metagenómica en cluster Kabré."
+
+nlp.data_embeddings$texto_para_ia[31] <- "Solicitud de instalación del módulo 'MultiQC' mediante 'pip' o 'conda' (bioconda) para análisis bioinformático en cluster."
+
+nlp.data_embeddings$texto_para_ia[32] <- "Solicitud de acceso a servidor de base de datos MySQL/MariaDB con fines de conexión externa desde el cluster."
+
+nlp.data_embeddings$texto_para_ia[33] <- "Solicitud de instalación de herramientas bioinformáticas 'MAUVE' y 'PanOCT' en cluster Kabré."
+
+nlp.data_embeddings$texto_para_ia[34] <- "Consulta sobre escalabilidad de almacenamiento: solicitud de extensión de cuota de 10GB para investigador y estudiante debido a limitaciones en análisis bioinformáticos."
+
+nlp.data_embeddings$texto_para_ia[35] <- "Solicitud de ampliación de cuota de almacenamiento: usuario requiere 400GB adicionales sobre los 100GB actuales para descarga y procesamiento de genomas."
+
+nlp.data_embeddings$texto_para_ia[36] <- "Error técnico en módulo 'EMBOSS': 'error while loading shared libraries: libimf.so' y errores similares en ejecución de binarios, indicando posibles librerías faltantes en entorno de usuario."
+
+nlp.data_embeddings$texto_para_ia[37] <- "Solicitud de instalación de 'Mamba' como gestor de paquetes conda y ampliación de cuota de almacenamiento a 1TB para usuario 'taller-1863' con fines de capacitación."
+
+nlp.data_embeddings$texto_para_ia[38] <- "Error de Slurm en nodo 'nukwa-wide': 'Batch job submission failed: Requested GRES option unsupported' al solicitar GPU mediante '--gpus-per-task=1' en script de ejecución."
+
+nlp.data_embeddings$texto_para_ia[39] <- "Solicitud de instalación de librería 'pymp-pypi' mediante 'pip3' en entorno Python 3 para curso de computación paralela."
+
+nlp.data_embeddings$texto_para_ia[40] <- "Solicitud de instalación de software 'MrBayes' con soporte para paralelismo MPI."
+
+nlp.data_embeddings$texto_para_ia[41] <- "Solicitud de instalación de 'pigz' como dependencia para habilitar soporte multi-core en 'cutadapt' durante análisis bioinformáticos."
+
+nlp.data_embeddings$texto_para_ia[42] <- "Solicitud de instalación de software proteómico 'Perseus' (MaxQuant) y 'LFQ-Analyst' en el cluster Kabré."
+
+nlp.data_embeddings$texto_para_ia[43] <- "Solicitud de creación de cuenta de usuario adicional ('limpia') con configuración por defecto para fines demostrativos en talleres académicos."
+
+nlp.data_embeddings$texto_para_ia[44] <- "Consulta sobre métodos de transferencia de datos masivos (metagenómica) desde el sistema de archivos 'work' a dispositivo físico externo para optimización de cuotas de almacenamiento."
+
+nlp.data_embeddings$texto_para_ia[45] <- "Solicitud de apoyo académico para curso de metagenómica: requerimiento de clase introductoria sobre uso del cluster y gestión de cuentas temporales para estudiantes."
+
+nlp.data_embeddings$texto_para_ia[46] <- "Solicitud de instalación de software de alineamiento genómico 'Mauve' y 'ProgressiveMauve' en cluster Kabré."
+
+nlp.data_embeddings$texto_para_ia[47] <- "Error de ejecución en herramienta 'Cactus' tras activar entorno conda: 'IOError: [Errno 13] Permission denied', indicando problemas de permisos en archivos o directorios."
+
+nlp.data_embeddings$texto_para_ia[48] <- "Consulta técnica sobre dependencias de Perl faltantes para ejecución de script 'convertAlignment.pl' en el cluster."
+
+nlp.data_embeddings$texto_para_ia[49] <- "Error en script Slurm al ejecutar 'BUSCO.py': 'python: can't open file: [Errno 2] No such file or directory'. Consulta sobre configuración correcta de entorno y ruta del binario en partición 'dribe-long'."
+
+nlp.data_embeddings$texto_para_ia[50] <- "Solicitud de instalación de 'Pilon' versión 1.24 mediante gestor de paquetes conda en cluster Kabré."
+
+nlp.data_embeddings$texto_para_ia[51] <- "Solicitud de instalación del software bioinformático 'trimAl' para el filtrado de alineamientos de baja calidad."
+
+nlp.data_embeddings$texto_para_ia[52] <- "Solicitud de instalación de herramientas de bioinformática para clasificación de plásmidos: 'PassFlow', 'PlasClass', 'Platon' y 'RFPlasmid'."
+
+nlp.data_embeddings$texto_para_ia[53] <- "Consulta técnica sobre la ubicación del archivo 'picard.jar' en la infraestructura del cluster para ejecución de binarios Java."
+
+nlp.data_embeddings$texto_para_ia[54] <- "Solicitud de aumento temporal de almacenamiento para simulaciones climáticas (modelo WRF) y consulta sobre factibilidad de transferencia de datos mediante disco duro USB externo."
+
+nlp.data_embeddings$texto_para_ia[55] <- "Solicitud de ampliación de cuota de almacenamiento: usuario requiere 300GB adicionales, habiendo alcanzado el 97% de su capacidad actual de 500GB."
+
+nlp.data_embeddings$texto_para_ia[56] <- "Solicitud de actualización de 'AntiSMASH' a versión 6.0, instalación de 'BigScape', 'Corazon', y consulta sobre factibilidad de ejecutar 'Evomining' vía Docker."
+
+nlp.data_embeddings$texto_para_ia[57] <- "Incidencia: notificación de trabajo Slurm mediante '--mail-type=ALL' no está funcionando. Consulta sobre posible falla en configuración de relay de correo o parámetros del usuario."
+
+nlp.data_embeddings$texto_para_ia[58] <- "Consulta sobre optimización de rendimiento HPC para modelo WRF: problemas de segmentación en partición 'nu-long' y solicitud de incremento de tiempo o nodos en 'nu-wide' para simulaciones climáticas de larga duración."
+
+nlp.data_embeddings$texto_para_ia[59] <- "Solicitud de actualización de dirección de correo electrónico vinculada al perfil de usuario."
+
+nlp.data_embeddings$texto_para_ia[60] <- "Incidencia de acceso: usuario reporta error de autenticación SSH al cluster, mientras otros usuarios pueden ingresar exitosamente. Solicitud de revisión de estado de cuenta."
+
+nlp.data_embeddings$texto_para_ia[61] <- "Solicitud de ampliación de cuota de almacenamiento: usuario requiere 250GB para análisis de transcriptómica y genomas bacterianos."
+
+nlp.data_embeddings$texto_para_ia[62] <- "Solicitud de instalación de herramienta bioinformática 'Platon' mediante gestor de paquetes conda."
+
+nlp.data_embeddings$texto_para_ia[63] <- "Consulta técnica sobre optimización de rendimiento HPC para IQTree: solicitud de guía para evitar finalización de procesos por exceder límites de tiempo (time limit) en partición 'dribe-long'."
+
+nlp.data_embeddings$texto_para_ia[64] <- "Solicitud de actualización de versiones de software bioinformático para resolución de conflictos de compatibilidad: Trinity RNA-Seq 2.14.0, SAMtools 1.16, Jellyfish 2.3.0, Bowtie2 2.4.5 y Salmon 1.9.0."
+
+nlp.data_embeddings$texto_para_ia[65] <- "Solicitud de actualización del módulo 'CheckV' en entorno miniconda."
+
+nlp.data_embeddings$texto_para_ia[66] <- "Solicitud de actualización de herramienta bioinformática 'Flye' a versión 2.9.1."
+
+nlp.data_embeddings$texto_para_ia[67] <- "Solicitud de instalación de paquetes R (4.1.3): poppr, adegenet, mmod, treemap, pegas, pinfsc50, kable, knitr, tidyverse, hierfstat, diversityR."
+
+nlp.data_embeddings$texto_para_ia[68] <- "Incidencia técnica en nodos 'nukwa' (04-07): error 'NVIDIA-SMI has failed to communicate with the NVIDIA driver'. Consulta sobre estado de drivers o configuración de entorno GPU."
+
+nlp.data_embeddings$texto_para_ia[69] <- "Solicitud de instalación de 'FastStructure' vía gestor de paquetes conda."
+
+nlp.data_embeddings$texto_para_ia[70] <- "Incidencia de software: error 'cannot locate Trinity-specific tool: ParaFly' tras actualización reciente de Trinity RNA-Seq, sugiriendo falla en la configuración del PATH o instalación incompleta."
+
+nlp.data_embeddings$texto_para_ia[71] <- "Incidencia técnica en herramienta 'EMBOSS' (comando 'cons'): 'error while loading shared libraries: libimf.so', indicando falta de librerías del compilador. Solicitud de revisión de instalación o uso de entorno conda."
+
+nlp.data_embeddings$texto_para_ia[72] <- "Solicitud de ampliación de cuota de almacenamiento: usuario ha alcanzado el 100% de 800GB y requiere 700GB adicionales para procesamiento de genomas."
+
+nlp.data_embeddings$texto_para_ia[73] <- "Solicitud de aumento de cuota de almacenamiento para tareas bioinformáticas (ensamblaje y anotación de genomas bacterianos y eucariotas)."
+
+nlp.data_embeddings$texto_para_ia[74] <- "Solicitud de actualización de herramienta 'Platon' en entorno conda de versión 1.1 a 1.6 o superior."
+
+nlp.data_embeddings$texto_para_ia[75] <- "Incidencia de red: solicitud de apertura de puerto en firewall para permitir descarga de base de datos desde IP externa (130.14.250.7)."
+
+nlp.data_embeddings$texto_para_ia[76] <- "Solicitud de instalación de ensamblador 'Unicycler' en cluster Kabré para ensamblajes bacterianos."
+
+nlp.data_embeddings$texto_para_ia[77] <- "Solicitud de instalación de paquetes R ('raster', 'ENMTools', 'dismo') en versiones 4.1.3 y 3.5.1, junto con el software 'MaxEnt' para modelado de distribución de especies."
+
+nlp.data_embeddings$texto_para_ia[78] <- "Solicitud de instalación de software 'ConFindr' en cluster, requiriendo permisos de administrador para su configuración global."
+
+nlp.data_embeddings$texto_para_ia[79] <- "Solicitud de actualización de herramienta 'Mash' por incompatibilidad de versión y petición de instalación del software 'Blobtools'."
+
+nlp.data_embeddings$texto_para_ia[80] <- "Solicitud de instalación de módulos bioinformáticos: 'SRA toolkit' (v3.0.0), 'HomBlocks' y 'GetOrganelle' (v1.7.7.0)."
+
+nlp.data_embeddings$texto_para_ia[81] <- "Incidencia de red: solicitud de apertura de acceso a APIs externas y mirrors (URLs, rsync) debido a restricciones de tráfico en el cluster."
+
+nlp.data_embeddings$texto_para_ia[82] <- "Solicitud de instalación de software bioinformático 'Bowtie2' versión 2.5.0."
+
+nlp.data_embeddings$texto_para_ia[83] <- "Solicitud de ampliación de cuota de almacenamiento: usuario requiere espacio adicional para ejecutar 'trim_galore' en experimentos de transcriptómica."
+
+nlp.data_embeddings$texto_para_ia[84] <- "Solicitud de instalación de versiones actualizadas de módulos bioinformáticos: 'ncbi-magicblast', 'smartdenovo' y 'nanoplot'."
+
+nlp.data_embeddings$texto_para_ia[85] <- "Solicitud de ampliación de 100GB de almacenamiento en espacio 'work' para procesamiento de datasets de café (70GB iniciales + archivos de salida)."
+
+nlp.data_embeddings$texto_para_ia[86] <- "Consulta técnica sobre configuración de Jupyter: solicitud de visibilidad/acceso al directorio 'work' desde la plataforma Jupyter, limitado actualmente al directorio 'home'."
+
+nlp.data_embeddings$texto_para_ia[87] <- "Solicitud de ampliación de cuota de almacenamiento: usuario requiere espacio adicional tras generar 124GB de secuencias limpias (RNA-seq) excediendo su capacidad actual."
+
+nlp.data_embeddings$texto_para_ia[88] <- "Incidencia de ejecución: error de permisos 'no hay acceso para ingresar al archivo jar' al ejecutar 'Medusa' en ensamblaje de genomas eucariotas."
+
+nlp.data_embeddings$texto_para_ia[89] <- "Solicitud de instalación del software bioinformático 'VIRIDIC' en el cluster."
+
+nlp.data_embeddings$texto_para_ia[90] <- "Solicitud de transferencia de archivos entre cuentas de usuario: requerimiento de mover directorios específicos ('ENA_genomes_orfs', 'QIIME2', 'rpoB') a la cuenta del usuario 'rcampos'."
+
+nlp.data_embeddings$texto_para_ia[91] <- "Solicitud de instalación de herramienta bioinformática 'Kraken2' en el cluster."
+
+nlp.data_embeddings$texto_para_ia[92] <- "Solicitud de actualización global de 'Miniconda' a la versión más reciente en el cluster."
+
+nlp.data_embeddings$texto_para_ia[93] <- "Incidencia en pipeline 'Predector': error de ejecución por ausencia de 'phobius.pl' en el PATH del entorno. Solicitud de configuración de dependencias para completar la instalación."
+
+nlp.data_embeddings$texto_para_ia[94] <- "Solicitud de instalación de 'SignalP', incluyendo versiones heredadas (v4.0) para compatibilidad con análisis existentes."
+
+nlp.data_embeddings$texto_para_ia[95] <- "Solicitud de creación de entornos Conda específicos con soporte GPU para: PyTorch, TensorFlow, Cupy, Numba y soporte CPU para FEniCSx."
+
+nlp.data_embeddings$texto_para_ia[96] <- "Solicitud de instalación de suite de herramientas para análisis de elementos transponibles: 'RepeatModeler', 'REPET', 'TE Class' y 'RepeatMasker'."
+
+nlp.data_embeddings$texto_para_ia[97] <- "Solicitud de actualización de entorno Miniconda para resolución de incidencias técnicas reportadas por el usuario."
+
+nlp.data_embeddings$texto_para_ia[98] <- "Solicitud de instalación del software bioinformático 'pharokka' en el cluster."
+
+nlp.data_embeddings$texto_para_ia[99] <- "Solicitud de instalación del software 'Platon' en el cluster mediante gestor de paquetes conda."
+
+nlp.data_embeddings$texto_para_ia[100] <- "Solicitud de instalación del software 'RFPlasmid' en el cluster."
+
+nlp.data_embeddings$texto_para_ia[101] <- "Solicitud de instalación de las herramientas bioinformáticas 'PlasForest' y 'PLSDB' en el cluster."
+
+nlp.data_embeddings$texto_para_ia[102] <- "Solicitud de ejecución del proceso de inicialización de las bases de datos de 'RFPlasmid' mediante el comando 'rfplasmid --initialize' en entorno conda."
+
+nlp.data_embeddings$texto_para_ia[103] <- "Solicitud de ampliación de cuota de almacenamiento: usuario requiere duplicar su capacidad actual (300GB) debido a la generación de archivos temporales de gran volumen durante ejecuciones de Slurm."
+
+nlp.data_embeddings$texto_para_ia[104] <- "Solicitud de creación de cuentas de usuario temporales para estudiantes de Licenciatura en Biotecnología de la Universidad Nacional (UNA)."
+
+nlp.data_embeddings$texto_para_ia[105] <- "Solicitud de ampliación de cuota de almacenamiento para permitir la ejecución del software 'Trinity', actualmente bloqueada por falta de espacio en disco."
+
+nlp.data_embeddings$texto_para_ia[106] <- "Incidencia de software: error de compatibilidad entre 'Trinity' y 'Salmon'. Consulta técnica sobre la configuración del PATH de los ejecutables y dependencias necesarias para el funcionamiento de Trinity."
+
+nlp.data_embeddings$texto_para_ia[107] <- "Consulta sobre disponibilidad e instalación de software para el análisis de calidad de transcriptomas ensamblados."
+
+nlp.data_embeddings$texto_para_ia[108] <- "Solicitud de ampliación de cuota de almacenamiento a 1TB adicional para proyecto de comparación genómica a gran escala."
+
+nlp.data_embeddings$texto_para_ia[109] <- "Solicitud de instalación del software 'rnaQUAST' para su integración en pipelines de bioinformática del laboratorio de la UNA."
+
+nlp.data_embeddings$texto_para_ia[110] <- "Solicitud de instalación de librerías de Python en entorno conda: 'mysql-connector-python', 'tensorflow', 'numba', 'sndfile', 'matplotlib', 'pandas', 'pyculib', 'librosa', 'seaborn' y 'noisereduce'."
+
+nlp.data_embeddings$texto_para_ia[111] <- "Solicitud de instalación de la versión 'full' actualizada de 'Trinity' para resolver problemas de compatibilidad y dependencias obsoletas en la instalación actual del cluster."
+
+nlp.data_embeddings$texto_para_ia[112] <- "Solicitud de actualización de 'Trinity' a la versión más reciente, incluyendo todas las dependencias necesarias, tras consulta técnica con desarrolladores en GitHub."
+
+nlp.data_embeddings$texto_para_ia[113] <- "Solicitud de instalación de 'CMake' versión 3.26.0 para habilitar características de compilación avanzadas."
+
+nlp.data_embeddings$texto_para_ia[114] <- "Solicitud de instalación de 'MPICH' versión 4.1.1 para disponer de las funcionalidades más recientes de la biblioteca de paralelismo."
+
+nlp.data_embeddings$texto_para_ia[115] <- "Solicitud de instalación de 'featureCounts' (subread) en entorno conda para procesamiento de datos bioinformáticos."
+
+nlp.data_embeddings$texto_para_ia[116] <- "Solicitud de transferencia de archivos: requerimiento de mover la totalidad de una carpeta entre usuarios ('jstynoski') con cambio de permisos y reubicación en 'workspace' de destino."
+
+nlp.data_embeddings$texto_para_ia[117] <- "Solicitud de instalación del programa bioinformático 'GUIDANCE2' en el cluster."
+
+nlp.data_embeddings$texto_para_ia[118] <- "Solicitud de actualización de la herramienta de depuración de memoria 'Valgrind' a la versión más reciente."
+
+nlp.data_embeddings$texto_para_ia[119] <- "Incidencia técnica en pipeline 'prokka': error de ejecución en 'tbl2asn'. Solicitud de actualización de binarios según instrucciones de desarrolladores para corregir incompatibilidad de versión."
+
+nlp.data_embeddings$texto_para_ia[120] <- "Solicitud de actualización de 'PLINK' de versión 1.07 a 1.9 para habilitar el argumento '--allow-extra-chr', necesario para análisis de datos genómicos RADseq de especies no modelo."
+
+nlp.data_embeddings$texto_para_ia[121] <- "Solicitud de instalación del software de visualización taxonómica 'Krona' para el análisis de resultados metagenómicos."
+
+nlp.data_embeddings$texto_para_ia[122] <- "Solicitud de instalación de los módulos bioinformáticos 'RagTag' y 'dRep'. Adicionalmente, consulta técnica sobre la ruta de instalación y disponibilidad de las librerías base de Python/Anaconda: 'numpy', 'matplotlib' y 'matplotlib-venn'."
+
+# Reemplazar el log masivo por un resumen técnico de alta densidad para la IA
+nlp.data_embeddings$texto_para_ia[123] <- "Incidencia técnica en 'Bowtie2': el proceso de alineamiento finaliza con error (value 1) tras mostrar tasas de concordancia extremadamente bajas en los archivos de lectura. Se requiere diagnóstico de calidad de los archivos FASTQ."
+
+# Bloque 124: Incidencia de conectividad SSH
+nlp.data_embeddings$texto_para_ia[124] <- "Incidencia de acceso SSH: error de autenticación ('publickey, gssapi-keyex, gssapi-with-mic, password') al intentar descargar archivos desde Kabré hacia equipo local, a pesar de tener configuradas las llaves SSH."
+
+# Bloque 125: Solicitud de entorno científico para análisis de datos
+nlp.data_embeddings$texto_para_ia[125] <- "Solicitud de instalación del módulo 'xarray' en el entorno 'miniconda' para realizar análisis y manipulación de datos multidimensionales."
+
+# Bloque 126: Propuesta técnica de gestión centralizada de bases de datos y software
+nlp.data_embeddings$texto_para_ia[126] <- "Propuesta técnica para la creación de un directorio centralizado en '/opt/databases' destinado a albergar genomas de referencia, índices de 'Bowtie2' y bases de datos de investigación (WOL, Tara Oceans, OceanDNA_rep) para acceso común de usuarios. Incluye solicitud de priorización de instalación para herramientas de filtrado ([P]) y configuración de rutas (PATH) para software bioinformático como 'HiFiAdapterFilt'."
+
+# Bloque 127: Incidencia de entorno en MetaPhlAn
+nlp.data_embeddings$texto_para_ia[127] <- "Incidencia técnica en 'MetaPhlAn': error de ejecución 'numpy python library not detected' tras cargar módulos de entorno ('intelpython3.7', 'miniconda'). Consulta sobre resolución de conflictos de dependencias en Python."
+
+# Bloque 128: Solicitud administrativa de limpieza de archivos
+nlp.data_embeddings$texto_para_ia[128] <- "Solicitud administrativa de borrado/eliminación de un directorio específico en el sistema de archivos del cluster."
+
+# Bloque 129: Solicitud de ampliación de cuota de almacenamiento
+nlp.data_embeddings$texto_para_ia[129] <- "Solicitud de ampliación de cuota en unidad 'work' a 400GB para procesamiento de datos de transcriptómica."
+
+# Bloque 130: Solicitud de actualización de software bioinformático
+nlp.data_embeddings$texto_para_ia[130] <- "Solicitud de actualización de la herramienta 'breseq' de la versión 0.31.0 a la 0.37.0 para análisis de poblaciones bacterianas evolucionadas."
+nlp.data_embeddings$texto_para_ia[131] <- "Solicitud de actualización de 'breseq' de la versión 0.31.0 a la 0.37.0 para estudios de evolución bacteriana."
+
+nlp.data_embeddings$texto_para_ia[132] <- "Solicitud de ampliación temporal de cuota en directorio 'work' para evitar saturación durante la generación de archivos pesados en análisis bioinformáticos."
+
+nlp.data_embeddings$texto_para_ia[133] <- "Solicitud técnica: inicialización de base de datos para 'RFPlasmid' mediante comando 'rfplasmid --initialize' en entorno conda."
+
+nlp.data_embeddings$texto_para_ia[134] <- "Solicitud de ampliación de cuota de almacenamiento: usuario requiere 200GB adicionales sobre los 100GB actuales para completar análisis bioinformáticos."
+
+nlp.data_embeddings$texto_para_ia[135] <- "Solicitud de ampliación de cuota (usuario: emaraya): requerimiento de 200GB adicionales para carga de trabajo bioinformática."
+
+nlp.data_embeddings$texto_para_ia[136] <- "Incidencia técnica en 'Stellopt': error de carga de módulo por falta de dependencias 'netcdf-fortran' y 'openmpi'."
+
+nlp.data_embeddings$texto_para_ia[137] <- "Incidencia de software: falla en módulos de Python 'xarray' y 'eofs' instalados en miniconda, posiblemente por corrupción de entorno o actualización de dependencias."
+
+nlp.data_embeddings$texto_para_ia[138] <- "Solicitud de instalación personalizada de 'NVIDIA Modulus' mediante Singularity (contenedor) para creación de un módulo compartido en Kabré."
+
+nlp.data_embeddings$texto_para_ia[139] <- "Incidencia de rendimiento HPC: degradación severa en tiempos de ejecución en partición 'dribe' comparado con equipo local. Consulta sobre posible sobrecarga en nodos de cómputo."
+
+nlp.data_embeddings$texto_para_ia[140] <- "Solicitud de ampliación de cuota de almacenamiento: usuario requiere 1TB adicional, habiendo alcanzado el 90% de su cuota actual de 1TB para optimización de modelos de entrenamiento."
+
+nlp.data_embeddings$texto_para_ia[141] <- "Incidencia en pipeline 'transrate': error por falta de dependencias (blastplus) y saturación de espacio en disco durante la instalación automática de dependencias."
+
+# Bloque 142: Incidencia de compilación de software
+nlp.data_embeddings$texto_para_ia[142] <- "Incidencia de compilación: error 'cannot find -lltdl' durante la fase de enlace (linking). Solicitud de instalación de la dependencia 'libtool-ltdl-devel'."
+
+# Bloque 143: Solicitud de instalación de software bioinformático
+nlp.data_embeddings$texto_para_ia[143] <- "Solicitud de instalación del software bioinformático 'VIBRANT' en el cluster para análisis de datos de tesis."
+
+# Bloque 144: Solicitud de software con requerimientos de alta memoria (RAM)
+nlp.data_embeddings$texto_para_ia[144] <- "Solicitud de instalación de 'Picrust2' para análisis de alta demanda de memoria RAM que exceden la capacidad de computación local."
+
+# Bloque 145: Solicitud de actualización de software
+nlp.data_embeddings$texto_para_ia[145] <- "Solicitud de actualización de la herramienta bioinformática 'Prodigal' a su versión más reciente."
+
+# Bloque 146: Incidencia técnica en pipeline bioinformático
+nlp.data_embeddings$texto_para_ia[146] <- "Incidencia técnica en 'Picrust2': error 'No FASTA file found' y falta de archivos de referencia esperados. Consulta sobre posible falla en la instalación o configuración de directorios de referencia."
+
+# Bloque 147: Solicitud de instalación vía Conda
+nlp.data_embeddings$texto_para_ia[147] <- "Solicitud de instalación de la herramienta 'Chopper' mediante gestor de paquetes conda."
+
+# Bloque 148: Incidencia de ejecución de código
+nlp.data_embeddings$texto_para_ia[148] <- "Consulta técnica general: reporte de error en ejecución de código que funciona correctamente en otros entornos. Solicitud de depuración para identificar posibles incompatibilidades en el cluster."
+
+# Bloque 149: Solicitud de instalación vía Conda
+nlp.data_embeddings$texto_para_ia[149] <- "Solicitud de instalación de la herramienta 'RGI' (Resistance Gene Identifier) mediante gestor de paquetes miniconda."
+
+# Bloque 150: Incidencia de conectividad (SSH)
+nlp.data_embeddings$texto_para_ia[150] <- "Incidencia de acceso SSH: dificultad de conexión al cluster desde el 2 de julio. Consulta sobre posibles cambios en la configuración de acceso o mantenimiento no notificado."
+
+# Bloque 151: Consulta técnica sobre software (Apptainer)
+nlp.data_embeddings$texto_para_ia[151] <- "Consulta informativa: confirmación sobre la equivalencia y actualización de la tecnología 'Singularity' a 'Apptainer'."
+
+# Bloque 152: Consulta de uso de software
+nlp.data_embeddings$texto_para_ia[152] <- "Consulta de uso: solicitud de información sobre el comando de ejecución para la herramienta 'PlasForest' instalada en el cluster."
+
+# Bloque 153: Solicitud de instalación de software
+nlp.data_embeddings$texto_para_ia[153] <- "Solicitud de instalación del software 'GCTA' para generación de matrices de parentesco genómico (GRM) en análisis de datos RADseq."
+
+# Bloque 154: Solicitud de ampliación de cuota
+nlp.data_embeddings$texto_para_ia[154] <- "Solicitud de ampliación de almacenamiento en 'work' (superando los 250GB actuales) para prevenir la interrupción de análisis bioinformáticos."
+
+# Bloque 155: Solicitud de actualización de framework de IA
+nlp.data_embeddings$texto_para_ia[155] <- "Solicitud de actualización de 'TensorFlow' (de v2.3.1 a v2.11/v2.12) para habilitar compatibilidad con el paquete 'scikeras'."
+
+# Bloque 156: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[156] <- "Solicitud de instalación del módulo bioinformático 'Metapop' en el cluster."
+
+# Bloque 157: Solicitud de actualización de software
+nlp.data_embeddings$texto_para_ia[157] <- "Solicitud de actualización de software a la versión 1.34 para resolver errores de ejecución en comparaciones 'todo contra todo' (all-vs-all) de genomas."
+
+# Bloque 158: Solicitud de instalación de entorno R
+nlp.data_embeddings$texto_para_ia[158] <- "Solicitud de instalación de R versión 4.2.0 y librerías estadísticas: 'spdep', 'Matrix', 'sf', 'INLA', 'StatMatch', 'factoextra'."
+
+# Bloque 159: Incidencia técnica en entorno R
+nlp.data_embeddings$texto_para_ia[159] <- "Incidencia técnica en entorno R: error de ejecución específico en la librería 'sf' tras actualización o cambio de configuración de entorno."
+
+# Bloque 160: Solicitud de soporte para compilación
+nlp.data_embeddings$texto_para_ia[160] <- "Solicitud de soporte técnico para la compilación manual de 'libcxx' y 'clang' a partir de fuentes externas."
+
+# Bloque 161: Solicitud de ampliación de cuota (Large-scale ML)
+nlp.data_embeddings$texto_para_ia[161] <- "Solicitud de ampliación de cuota en 'work' de 2TB a 3.5TB para almacenamiento de características (features) y entrenamiento de modelo en tesis doctoral."
+
+# Bloque 162: Solicitud de ampliación de cuota (Metagenómica)
+nlp.data_embeddings$texto_para_ia[162] <- "Solicitud de ampliación de cuota en 'work' a 5TB para descarga y procesamiento de datasets de metagenomas."
+
+# Bloque 163: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[163] <- "Solicitud de instalación del software bioinformático 'Filtlong' en el cluster."
+
+# Bloque 164: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[164] <- "Solicitud de instalación del software 'Poretools' en el cluster."
+
+# Bloque 165: Solicitud de entorno Python para Machine Learning
+nlp.data_embeddings$texto_para_ia[165] <- "Solicitud de entorno Python con librerías específicas: 'scikit-learn' (v1.3), 'XGBoost', 'mlxtend', 'shap' y 'cuML' (con requerimientos de soporte CUDA/GPU)."
+
+# Bloque 166: Solicitud de despliegue mediante Docker/Apptainer
+nlp.data_embeddings$texto_para_ia[166] <- "Solicitud de instalación/despliegue de aplicación mediante contenedor Docker en el cluster."
+
+# Bloque 167: Solicitud de implementación de IA (Whisper)
+nlp.data_embeddings$texto_para_ia[167] <- "Solicitud de despliegue del modelo 'Whisper' de OpenAI en nodos con GPU ('nukwa') para proyectos de conversión de audio a texto."
+
+# Bloque 168: Solicitud administrativa (Cuentas temporales curso)
+nlp.data_embeddings$texto_para_ia[168] <- "Solicitud de creación de 18 cuentas temporales para curso de Bioinformática (UNA), vigencia: 17 oct - 20 nov."
+
+# Bloque 169: Solicitud de ampliación de cuota (Sismología)
+nlp.data_embeddings$texto_para_ia[169] <- "Solicitud de aumento de cuota en 'work' a 200GB para usuario 'sgamboa' enfocado en experimentos sismológicos."
+
+# Bloque 170: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[170] <- "Solicitud de instalación de software externo vía repositorio público."
+
+# Bloque 171: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[171] <- "Solicitud de instalación de la herramienta 'PIRATE' mediante gestor de paquetes conda."
+
+# Bloque 172: Solicitud de habilitación de módulo
+nlp.data_embeddings$texto_para_ia[172] <- "Solicitud de habilitación del módulo de software 'Dorado' en el sistema."
+
+# Bloque 173: Solicitud de ampliación de cuota (Investigación Académica)
+nlp.data_embeddings$texto_para_ia[173] <- "Solicitud de ampliación de cuota en 'work' a 650GB para análisis transcriptómico de plantas de arroz (proyecto aprobado UNA)."
+
+# Bloque 174: Consulta de uso y documentación (Best Practices)
+nlp.data_embeddings$texto_para_ia[174] <- "Consulta técnica: solicitud de documentación o guías de ejecución para programas en entornos miniconda (ej. 'Mauve') tras la carga de módulos."
+
+# Bloque 175: Solicitud de habilitación de módulo
+nlp.data_embeddings$texto_para_ia[175] <- "Solicitud de habilitación del módulo de software 'pod5' en el cluster."
+
+# Bloque 176: Solicitud de instalación de herramientas de bioinformática comparativa
+nlp.data_embeddings$texto_para_ia[176] <- "Solicitud de instalación de herramientas de detección de transferencia horizontal de genes (HGT): 'HGTector2' y 'HGTphyloDetect'."
+
+# Bloque 177: Solicitud de actualización de software
+nlp.data_embeddings$texto_para_ia[177] <- "Solicitud de actualización de la herramienta bioinformática 'anvi'o' a la versión más reciente."
+
+# Bloque 178: Incidencia técnica (Conflicto de librerías Python/MKL)
+nlp.data_embeddings$texto_para_ia[178] <- "Incidencia técnica en pipeline 'MIMI': error 'ImportError: cannot import name _mklinit' relacionado con conflictos de dependencias entre 'numpy', 'scipy' e 'intelpython' en el cluster."
+
+# Bloque 179: Solicitud de instalación de herramientas de metagenómica
+nlp.data_embeddings$texto_para_ia[179] <- "Solicitud de instalación de herramientas 'Maxbin2' y 'BInSanity', integradas en entorno 'anvi'o-8' o como módulos independientes."
+
+# Bloque 180: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[180] <- "Solicitud de instalación de la herramienta 'Primer3' vía Bioconda o compilación desde fuentes."
+
+# Bloque 181: Incidencia de permisos de acceso compartido
+nlp.data_embeddings$texto_para_ia[181] <- "Incidencia de permisos: error de acceso a archivos compartidos mediante ACL (nfs4_setfacl) entre usuarios para revisión de tesis de transcriptómica. Consulta sobre configuración de acceso grupal."
+
+# Bloque 182: Solicitud de librería estadística para R
+nlp.data_embeddings$texto_para_ia[182] <- "Solicitud de instalación de la librería 'ncdf4' en el entorno R del cluster para procesamiento de modelos climáticos en formato netCDF."
+
+# Bloque 183: Solicitud de ampliación temporal de cuota
+nlp.data_embeddings$texto_para_ia[183] <- "Solicitud de ampliación temporal (1 mes) de 800GB-1TB en 'work' para completar análisis de secuencias tras pruebas exitosas con submuestras."
+
+# Bloque 184: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[184] <- "Solicitud de instalación de paquete de software no especificado."
+
+# Bloque 185: Solicitud de acceso a infraestructura de almacenamiento
+nlp.data_embeddings$texto_para_ia[185] <- "Solicitud de acceso al nuevo sistema de archivos compartido para tareas de entrenamiento de modelos de redes neuronales."
+
+# Bloque 186: Solicitud de ampliación de cuota (Temporal - Académico)
+nlp.data_embeddings$texto_para_ia[186] <- "Solicitud de ampliación temporal de 100GB en 'work' para el procesamiento de datos destinados a taller académico en la UCR."
+
+# Bloque 187: Solicitud de ampliación de cuota (Seguimiento)
+nlp.data_embeddings$texto_para_ia[187] <- "Solicitud de ampliación adicional de 100GB en 'work' tras alcanzar límite previo durante el desarrollo de taller académico."
+
+# Bloque 188: Solicitud de instalación de editor de texto (FUSE/AppImage)
+nlp.data_embeddings$texto_para_ia[188] <- "Solicitud de instalación de 'Neovim' en el cluster tras falla en ejecución de AppImage por falta de soporte FUSE y dependencias para compilación local."
+
+# Bloque 189: Solicitud de actualización de sistema
+nlp.data_embeddings$texto_para_ia[189] <- "Solicitud de actualización de 'git' a versión reciente para habilitar la instalación de plugins y dependencias en editores de código (Neovim)."
+
+# Bloque 190: Solicitud de habilitación de módulo
+nlp.data_embeddings$texto_para_ia[190] <- "Solicitud de habilitación del módulo de bioinformática 'DeepMRG' en el cluster."
+
+# Bloque 191: Incidencia de red (Rsync/Firewall)
+nlp.data_embeddings$texto_para_ia[191] <- "Incidencia de red: falla en comando 'rsync' hacia servidores externos (rcsb.org). El comando funciona en equipo local pero falla en el cluster, sugiriendo restricciones de firewall o configuración de puertos en el nodo."
+
+# Bloque 192: Solicitud de habilitación de módulo
+nlp.data_embeddings$texto_para_ia[192] <- "Solicitud de habilitación del módulo bioinformático 'GenoVi' en el cluster."
+
+# Bloque 193: Solicitud de instalación y dependencias de bases de datos
+nlp.data_embeddings$texto_para_ia[193] <- "Solicitud de instalación de 'PanVita' incluyendo bases de datos de referencia (BacMet, CARD, VFDB)."
+
+# Bloque 194: Solicitud de habilitación de módulo
+nlp.data_embeddings$texto_para_ia[194] <- "Solicitud de habilitación del módulo 'porechop_ABI' para análisis de secuencias."
+
+# Bloque 195: Solicitud de habilitación de módulo
+nlp.data_embeddings$texto_para_ia[195] <- "Solicitud de habilitación del módulo bioinformático 'medaka' en el cluster."
+
+# Bloque 196: Solicitud de entorno Python para Computer Vision
+nlp.data_embeddings$texto_para_ia[196] <- "Solicitud de entorno Python (v3.8+) con múltiples dependencias para Computer Vision: 'torch', 'timm', 'ultralytics' (v8.0.120), 'opencv-contrib-python' y librerías auxiliares."
+
+# Bloque 197: Incidencia técnica en script SLURM
+nlp.data_embeddings$texto_para_ia[197] <- "Incidencia de ejecución: error 'fg: no job control' en script SLURM durante la invocación de 'mafft'. Consulta sobre sintaxis de comandos y mejores prácticas de ejecución en particiones 'dribe-long'."
+
+# Bloque 198: Solicitud administrativa (Cuentas temporales curso)
+nlp.data_embeddings$texto_para_ia[198] <- "Solicitud de creación de cuentas temporales para curso docente (UNA). Vigencia requerida hasta el 5 de agosto (una semana posterior al 29 de julio)."
+
+# Bloque 199: Solicitud de instalación de pipeline metagenómico
+nlp.data_embeddings$texto_para_ia[199] <- "Solicitud de instalación de 'PlasBIn-flow' y su dependencia de entrada 'PlASgraph' para análisis de plásmidos."
+
+# Bloque 200: Solicitud de instalación de pipeline bioinformático
+nlp.data_embeddings$texto_para_ia[200] <- "Solicitud de instalación de la herramienta bioinformática 'qiime2' (versión 2023.9, especialidad amplicones)."
+
+# Bloque 201: Solicitud de compilación manual
+nlp.data_embeddings$texto_para_ia[201] <- "Solicitud de compilación desde fuentes de la herramienta 'MAXIT' para conversión de archivos de estructuras biológicas (CIF a PDB)."
+
+# Bloque 202: Solicitud de ampliación de cuota
+nlp.data_embeddings$texto_para_ia[202] <- "Solicitud de ampliación de cuota en 'work' a 1TB para análisis de datos de transcriptómica."
+
+# Bloque 203: Incidencia de almacenamiento (Falla de sistema)
+nlp.data_embeddings$texto_para_ia[203] <- "Incidencia crítica en el sistema de archivos nuevo: reporte de errores de lectura (I/O error). Requiere diagnóstico de integridad de disco o sistema de archivos."
+
+# Bloque 204: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[204] <- "Solicitud de instalación del modelo numérico 'DELFT3D' en el cluster Kabré."
+
+# Bloque 205: Solicitud de verificación de dependencias
+nlp.data_embeddings$texto_para_ia[205] <- "Consulta técnica: verificación de disponibilidad de la librería de Python 'COBRApy' para análisis de redes metabólicas."
+
+# Bloque 206: Incidencia de ejecución (Segmentation Fault)
+nlp.data_embeddings$texto_para_ia[206] <- "Incidencia técnica en 'Kaiju': error de ejecución 'Segmentation fault'. A pesar de pruebas en diferentes particiones ('andalan', 'dribe', 'nukwa'), el proceso falla, sugiriendo problemas de compatibilidad binaria o corrupción de memoria."
+
+# Bloque 207: Incidencia de administración de cuentas
+nlp.data_embeddings$texto_para_ia[207] <- "Solicitud de reseteo de credenciales de usuario por bloqueo de acceso tras cambio de contraseña."
+
+# Bloque 208: Incidencia técnica (Conflicto de librerías GLIBCXX)
+nlp.data_embeddings$texto_para_ia[208] <- "Incidencia técnica en R: error de carga de objetos compartidos ('GLIBCXX_3.4.20 not found') al intentar instalar/cargar paquetes 'brms' y 'caret'. Indica incompatibilidad entre la librería estándar de C++ del sistema y la versión esperada por los paquetes R."
+
+# Bloque 209: Incidencia de permisos (Posix/Collaboration)
+nlp.data_embeddings$texto_para_ia[209] <- "Incidencia de permisos: falla en la colaboración entre usuarios (transferencia de archivos). Consulta sobre la correcta implementación de permisos POSIX para directorios compartidos entre colaboradores."
+
+# Bloque 210: Solicitud de instalación de librerías de cálculo científico
+nlp.data_embeddings$texto_para_ia[210] <- "Solicitud de instalación de librerías base de cálculo científico: 'PETSC', 'BLAS' (libblas-dev) y 'LAPACK' (liblapack-dev)."
+
+# Bloque 211: Seguimiento de incidencia técnica
+nlp.data_embeddings$texto_para_ia[211] <- "Seguimiento técnico: consulta sobre disponibilidad de 'LP solvers' necesarios para el correcto funcionamiento de 'COBRApy' tras reporte inicial de error."
+
+# Bloque 212: Solicitud de plugin para pipeline bioinformático
+nlp.data_embeddings$texto_para_ia[212] <- "Solicitud de instalación del plugin 'RESCRIPT' integrado con la versión actual de 'QIIME 2' para análisis de datos de amplicones."
+
+# Bloque 213: Incidencia de importación de módulos (Entorno Python)
+nlp.data_embeddings$texto_para_ia[213] <- "Incidencia técnica: error de importación de funciones específicas dentro del paquete 'COBRApy', a pesar de la resolución del error de 'LP solvers'."
+
+# Bloque 214: Solicitud de actualización de versión (QIIME 2)
+nlp.data_embeddings$texto_para_ia[214] <- "Solicitud de instalación de la versión más reciente de 'QIIME 2' (2024.2, amplicon distribution)."
+
+# Bloque 215: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[215] <- "Solicitud de instalación de herramientas de software bioinformático (lista pendiente de especificación)."
+
+# Bloque 216: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[216] <- "Solicitud de instalación del software 'CONCOT' (herramienta de binning metagenómico) vía repositorio público."
+
+# Bloque 217: Solicitud de ampliación de cuota (Largo plazo)
+nlp.data_embeddings$texto_para_ia[217] <- "Solicitud de ampliación de cuota en 'work' (+500GB) por un periodo de 1 año para soporte del proyecto interdisciplinario 'Novo café Prospera'."
+
+# Bloque 218: Solicitud de ampliación de cuota (Temporal - Comparativa Genómica)
+nlp.data_embeddings$texto_para_ia[218] <- "Solicitud de ampliación de cuota en 'work' (+500GB adicionales) para comparativa genómica del proyecto 'Novo café Prospera', con compromiso de liberación en septiembre."
+
+# Bloque 219: Solicitud de ampliación de cuota (Metatranscriptómica)
+nlp.data_embeddings$texto_para_ia[219] <- "Solicitud de ampliación de cuota de almacenamiento para análisis de metatranscriptómica, ante la alta tasa de ocupación (75%) y volumen masivo de archivos."
+
+# Bloque 220: Consulta sobre gestión de entornos en R
+nlp.data_embeddings$texto_para_ia[220] <- "Consulta técnica: dificultad en la instalación de librerías R ('ggplot2', 'devtools', 'methylKit') por restricciones de permisos (sudo). Solicitud de creación de entorno de usuario personalizado para gestión de librerías de Bioconductor."
+
+# Bloque 221: Consulta técnica de hardware y particiones
+nlp.data_embeddings$texto_para_ia[221] <- "Consulta técnica: solicitud de información sobre la versión de 'NVIDIA Driver' en nodos 'nukwa' y sintaxis correcta para la selección de particiones específicas en SLURM."
+
+# Bloque 222: Incidencia de permisos de colaboración
+nlp.data_embeddings$texto_para_ia[222] <- "Solicitud de acceso: otorgar permisos de lectura a otro usuario ('ggutierrez') sobre un directorio de investigación específico para evitar transferencias de red ineficientes."
+
+# Bloque 223: Incidencia de entorno en cuentas educativas
+nlp.data_embeddings$texto_para_ia[223] <- "Incidencia técnica: falla en ejecución de 'Orthofinder', 'Augustus' e 'InterProScan' específicamente en cuentas de tipo 'taller'. Consulta sobre restricciones de ejecución y configuración de permisos para entornos educativos."
+
+# Bloque 224: Solicitud de ampliación temporal de cuota
+nlp.data_embeddings$texto_para_ia[224] <- "Solicitud de ampliación temporal de cuota en 'work' para finalización de análisis de tesis doctoral (CIBCM) con plan de purga posterior."
+
+# Bloque 225: Solicitud de ampliación de cuota
+nlp.data_embeddings$texto_para_ia[225] <- "Solicitud de incremento de cuota a 500GB para permitir la finalización de procesos de escritura de archivos intermedios."
+
+# Bloque 226: Solicitud de compilación paralela especializada
+nlp.data_embeddings$texto_para_ia[226] <- "Solicitud de instalación/compilación de librería 'HDF5' (v1.14.x) con soporte paralelo 'MPICH' (v4.1.1) para investigación en HPC."
+
+# Bloque 227: Solicitud de actualización
+nlp.data_embeddings$texto_para_ia[227] <- "Solicitud de actualización de la herramienta bioinformática 'mzMINE'."
+
+# Bloque 228: Incidencia técnica (Conflicto MKL/NumPy/Conda)
+nlp.data_embeddings$texto_para_ia[228] <- "Incidencia técnica en Python: error 'No module named numpy.core._multiarray_umath' y fallos de inicialización de Intel MKL. Indica un ambiente Conda corrupto o conflictos de librerías compartidas durante la ejecución de scripts gráficos."
+
+# Bloque 229: Solicitud de ampliación de cuota
+nlp.data_embeddings$texto_para_ia[229] <- "Solicitud de ampliación de 100GB en 'work' para análisis de genomas a gran escala."
+
+# Bloque 230: Solicitud de instalación optimizada (Quantum Espresso)
+nlp.data_embeddings$texto_para_ia[230] <- "Solicitud de instalación de 'Quantum Espresso' (v7.2) vinculada a 'Intel oneAPI' para optimización de rendimiento mediante 'ifort', 'mpiifort' y 'MKL'."
+
+# Bloque 231: Incidencia de compilación (Dependencia de sistema)
+nlp.data_embeddings$texto_para_ia[231] <- "Incidencia técnica: solicitud de actualización o instalación de la librería del sistema 'libstdc++.so.6' necesaria para la compilación de programas mediante 'ifort' (Intel Fortran Compiler)."
+
+# Bloque 232: Solicitud de infraestructura (Acceso a partición)
+nlp.data_embeddings$texto_para_ia[232] <- "Solicitud de aprovisionamiento: creación de directorio de usuario en la nueva partición de almacenamiento una vez finalizadas las tareas de mantenimiento del sistema de archivos."
+
+# Bloque 233: Solicitud de instalación de software
+nlp.data_embeddings$texto_para_ia[233] <- "Solicitud de instalación del software 'CHARMM' (Chemistry at HARvard Macromolecular Mechanics) para simulaciones de dinámica molecular."
+
+# Bloque 234: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[234] <- "Solicitud de instalación del software 'NAMD' (Nanoscale Molecular Dynamics) para simulaciones de dinámica molecular."
+
+# Bloque 235: Solicitud de ampliación de cuota masiva
+nlp.data_embeddings$texto_para_ia[235] <- "Solicitud de ampliación de cuota de almacenamiento a 10TB para soportar múltiples líneas de investigación con alta generación de datos bioinformáticos."
+
+# Bloque 236: Incidencia de acceso y gestión de perfil
+nlp.data_embeddings$texto_para_ia[236] <- "Incidencia de acceso: pérdida de acceso a directorio en partición de almacenamiento. Adicionalmente, solicitud administrativa de actualización de correo electrónico de contacto del usuario."
+
+# Bloque 237: Incidencia de ejecución en pipeline (GATK/Spark)
+nlp.data_embeddings$texto_para_ia[237] <- "Incidencia técnica en pipeline bioinformático: error de ejecución durante el paso 'MarkDuplicatesSpark' (GATK). El log muestra excepciones 'ClassReader' y 'ClosureCleaner', indicando una incompatibilidad de versiones entre las librerías de Spark/Java y el entorno de ejecución."
+
+# Bloque 238: Consulta técnica sobre ejecución (RAxML)
+nlp.data_embeddings$texto_para_ia[238] <- "Consulta técnica: solicitud de guías y plantillas de archivos SLURM para la ejecución de la herramienta 'RAxML' en el cluster."
+
+# Bloque 239: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[239] <- "Solicitud de instalación de herramientas de bioinformática: 'VRhyme', 'CAT' y 'CoverM' mediante gestor de paquetes."
+
+# Bloque 240: Incidencia de entorno (Incompatibilidad GLIBCXX)
+nlp.data_embeddings$texto_para_ia[240] <- "Incidencia técnica: error de 'GLIBCXX_3.4.20 not found' al ejecutar 'bedtools' en el nodo de login, a pesar de funcionar en el nodo de cómputo (SLURM). Consulta sobre la inconsistencia de entornos entre nodos y riesgo de ejecución incorrecta."
+
+# Bloque 241: Incidencia de ejecución y permisos en pipeline
+nlp.data_embeddings$texto_para_ia[241] <- "Incidencia técnica en 'SnpEff': error de tiempo de ejecución ('java.lang.RuntimeException: Cannot create directory') durante la descarga e instalación automática de genomas. La herramienta intenta escribir en directorios restringidos del sistema (share), lo cual bloquea la ejecución del usuario."
+
+# Bloque 242: Incidencia de red e infraestructura (I/O Bottleneck)
+nlp.data_embeddings$texto_para_ia[242] <- "Incidencia crítica de rendimiento: falla en la transferencia de datos entre el servidor de almacenamiento y el nodo 'nukwa-04', causando 'stalls' en la comunicación de red y detención del entrenamiento en GPU. Reporte basado en logs de 'dmesg' y telemetría de I/O."
+
+# Bloque 243: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[243] <- "Solicitud de instalación del 'Atomic Simulation Environment' (ASE) para la construcción de estructuras moleculares, preferiblemente mediante entorno Conda."
+
+# Bloque 244: Incidencia de conectividad (Filtrado de red/MLOps)
+nlp.data_embeddings$texto_para_ia[244] <- "Incidencia de conectividad: pérdida de conexión intermitente con la API de la plataforma 'clear.ml' durante el monitoreo de experimentos. Consulta sobre posibles restricciones o filtrado de tráfico saliente por políticas de red institucional (CONARE)."
+
+# Bloque 245: Solicitud de ampliación de cuota
+nlp.data_embeddings$texto_para_ia[245] <- "Solicitud de ampliación de cuota en 'work' a 250GB para el usuario 'sgamboa'."
+
+# Bloque 246: Propuesta técnica de mejora de infraestructura (Scratch local)
+nlp.data_embeddings$texto_para_ia[246] <- "Propuesta de infraestructura: implementación de almacenamiento 'scratch' local en nodos 'nukwa' para mitigar la sobrecarga en el sistema de archivos global y eliminar cuellos de botella de I/O durante el entrenamiento de modelos de deep learning."
+
+# Bloque 247: Solicitud de instalación de herramientas de perfilado
+nlp.data_embeddings$texto_para_ia[247] <- "Solicitud de instalación de 'Intel VTune Profiler' e 'Intel Software Development Emulator' para la caracterización y perfilado de rendimiento de algoritmos de encriptación postcuántica."
+
+# Bloque 248: Solicitud de ampliación de cuota (Análisis paralelos)
+nlp.data_embeddings$texto_para_ia[248] <- "Solicitud de ampliación de cuota en 'work' (+1TB) para soportar la ejecución simultánea de análisis paralelos y el mantenimiento de archivos de datos crudos (datasets 'HELICE' y 'secuencias Keilor')."
+
+# Bloque 249: Incidencia técnica (Falla en entorno de ejecución - Medusa)
+nlp.data_embeddings$texto_para_ia[249] <- "Incidencia técnica en 'Medusa': error de ejecución multifactorial. La 'Forma #1' falla por falta de dependencias de Python ('networkx'), mientras que la 'Forma #2' presenta una ruptura de PATH/variables de entorno ('nucmer', 'show-coords' no encontrados) y uso de librerías obsoletas ('cPickle')."
+
+# Bloque 250: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[250] <- "Solicitud de instalación de paquete de software no especificado."
+
+# Bloque 251: Solicitud de instalación (Pipeline)
+nlp.data_embeddings$texto_para_ia[251] <- "Solicitud de instalación de 'Nextflow', sistema de gestión de flujos de trabajo bioinformáticos."
+
+# Bloque 252: Incidencia de instalación (Conda)
+nlp.data_embeddings$texto_para_ia[252] <- "Incidencia técnica en instalación de 'quickmerge': fallos recurrentes en 'conda' (ModuleNotFoundError) y errores de conexión SSL/Handshake durante la resolución de dependencias desde canales bioconda."
+
+# Bloque 253: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[253] <- "Solicitud de instalación de herramienta bioinformática (especificaciones pendientes de adjunto)."
+
+# Bloque 254: Incidencia de permisos (ACL)
+nlp.data_embeddings$texto_para_ia[254] <- "Incidencia de acceso: usuario bloqueado de su propio directorio tras una ejecución incorrecta de 'nfs4_setfacl' al intentar gestionar permisos compartidos (ACL)."
+
+# Bloque 255: Incidencia de permisos (ACL)
+nlp.data_embeddings$texto_para_ia[255] <- "Incidencia de acceso: bloqueo total del directorio 'work' tras error en flag del comando 'nfs4_setfacl' al intentar revocar permisos a un colaborador."
+
+# Bloque 256: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[256] <- "Solicitud de instalación de herramienta bioinformática no especificada."
+
+# Bloque 257: Solicitud de ampliación de cuota
+nlp.data_embeddings$texto_para_ia[257] <- "Solicitud de ampliación de cuota en 'work' (200GB adicionales) para evitar interrupción de procesos en análisis de metagenomas de gran escala (>100GB)."
+
+# Bloque 258: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[258] <- "Solicitud de instalación de herramienta bioinformática (incluyendo configuración de bases de datos de referencia)."
+
+# Bloque 259: Solicitud de instalación (Pipeline)
+nlp.data_embeddings$texto_para_ia[259] <- "Solicitud de instalación del pipeline metagenómico 'MetaWRAP' vía gestión de paquetes Conda."
+
+# Bloque 260: Solicitud de actualización
+nlp.data_embeddings$texto_para_ia[260] <- "Solicitud de actualización de 'GTDB-Tk' para resolver errores de dependencias en bases de datos de referencia ('FastANI')."
+
+# Bloque 261: Incidencia de red (Aspera/NCBI)
+nlp.data_embeddings$texto_para_ia[261] <- "Incidencia de conectividad: falla en transferencia de datos pesados hacia servidores externos (NCBI). Se requiere habilitación de puertos UDP/TCP específicos para el protocolo Aspera en el firewall institucional."
+
+# Bloque 262: Solicitud de ampliación de cuota
+nlp.data_embeddings$texto_para_ia[262] <- "Solicitud de ampliación de cuota en 'work' para usuario 'anromero' (LABAP-UNA) para el procesamiento de datos genómicos en proyectos de investigación activos."
+
+# Bloque 263: Incidencia de acceso (SSH)
+nlp.data_embeddings$texto_para_ia[263] <- "Incidencia de acceso: usuario presenta falla de conectividad vía SSH al cluster, a pesar de mantener acceso funcional a sesiones de JupyterHub."
+
+# Bloque 264: Solicitud de ampliación de cuota
+nlp.data_embeddings$texto_para_ia[264] <- "Solicitud de ampliación de cuota en 'work' a 500GB para estudiante investigador de la UCR, requerido para proyecto de metagenómica durante el semestre académico."
+
+# Bloque 265: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[265] <- "Solicitud de instalación de pipeline bioinformático 'COBRA' para el ensamblaje de genomas virales desde muestras metagenómicas."
+
+# Bloque 266: Incidencia de estado de nodos (SLURM)
+nlp.data_embeddings$texto_para_ia[266] <- "Incidencia técnica: reporte de nodos de cómputo 'nukwa' en estados 'alloc' o 'down', impidiendo la asignación de recursos para tareas programadas."
+
+# Bloque 267: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[267] <- "Solicitud de instalación de la herramienta bioinformática 'pyani' para el cálculo de promedio de identidad de nucleótidos."
+
+# Bloque 268: Incidencia técnica (SCP/Conectividad)
+nlp.data_embeddings$texto_para_ia[268] <- "Incidencia técnica: falla en el comando 'scp' para transferencia de archivos entre el cluster y equipo local (Windows). Posible error en sintaxis de puertos o configuración del cliente local."
+
+# Bloque 269: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[269] <- "Solicitud de instalación de la versión más reciente de 'Siesta' (Simulación de sistemas electrónicos) compilada con soporte paralelo."
+
+# Bloque 270: Incidencia de entorno (Consecuencia de migración de datos)
+nlp.data_embeddings$texto_para_ia[270] <- "Incidencia técnica: errores en pipelines bioinformáticos ('CheckM2', 'Prokka') tras la migración de bases de datos desde 'work' a 'data'. Reporte de rutas rotas y configuración de variables de entorno."
+
+# Bloque 271: Solicitud de despliegue de pipeline personal
+nlp.data_embeddings$texto_para_ia[271] <- "Solicitud de instalación de pipeline personalizado. El usuario requiere permisos especiales de escritura sobre el directorio 'miniconda3' para actualizar scripts de flujo de trabajo de forma independiente."
+
+# Bloque 272: Incidencia de dependencias en R
+nlp.data_embeddings$texto_para_ia[272] <- "Incidencia técnica: falta de librería 'genoPlotR' en el entorno 'miniconda'. Solicitud de actualización de paquetes dentro del ambiente para permitir la visualización de resultados."
+
+# Bloque 273: Incidencia de dependencias faltantes
+nlp.data_embeddings$texto_para_ia[273] <- "Incidencia técnica: error de ejecución en la herramienta 'ccfind' por ausencia de dependencia ('ssearch36'). Consulta sobre la nomenclatura de módulos instalados."
+
+# Bloque 274: Solicitud de actualización
+nlp.data_embeddings$texto_para_ia[274] <- "Solicitud de actualización de 'Abricate' a la última versión para disponer de bases de datos actualizadas (2023)."
+
+# Bloque 275: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[275] <- "Solicitud de instalación de herramienta bioinformática no especificada."
+
+# Bloque 276: Incidencia de entorno (Permisos/Configuración)
+nlp.data_embeddings$texto_para_ia[276] <- "Incidencia técnica en 'CheckM' y 'CheckM2': errores de 'Permission denied' al intentar configurar la ruta de bases de datos ('setRoot') y archivos inexistentes. Indica mala configuración de rutas de datos tras migración."
+
+# Bloque 277: Consulta de soporte de ejecución
+nlp.data_embeddings$texto_para_ia[277] <- "Consulta técnica sobre el despliegue de 'SignalP' v4.1: conflicto con la versión de Perl disponible y requisitos de ejecución desde directorios específicos. Solicitud de documentación o ejemplo de ejecución funcional."
+
+# Bloque 278: Incidencia de permisos (I/O)
+nlp.data_embeddings$texto_para_ia[278] <- "Incidencia técnica en 'KeggCharter': error de 'Permission denied' al intentar crear directorios de salida. Indica que el usuario intenta escribir en rutas restringidas del clúster."
+
+# Bloque 279: Incidencia de entorno gráfico (X11)
+nlp.data_embeddings$texto_para_ia[279] <- "Incidencia de acceso: error de 'Xauthority' durante la conexión al clúster, lo cual bloquea la inicialización de instaladores gráficos (ej. Anaconda), a pesar de tener X11 habilitado."
+
+# Bloque 280: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[280] <- "Solicitud de instalación de la herramienta 'Strainy'."
+
+# Bloque 281: Incidencia de ejecución y dependencias
+nlp.data_embeddings$texto_para_ia[281] <- "Incidencia técnica en pipelines metagenómicos ('viralverify', 'viralsorter'): error de permisos en creación de entornos Conda y falla en ejecución de 'hmmsearch' por archivos de dominio HMM vacíos o inaccesibles."
+
+# Bloque 282: Solicitud de ampliación de cuota (Home)
+nlp.data_embeddings$texto_para_ia[282] <- "Solicitud de ampliación de cuota en el directorio '$HOME' para permitir la gestión y despliegue de entornos Conda y sus dependencias."
+
+# Bloque 283: Incidencia de infraestructura y cuotas
+nlp.data_embeddings$texto_para_ia[283] <- "Incidencia de rendimiento y capacidad: errores recurrentes por falta de espacio/memoria en procesos metagenómicos masivos. Solicitud de ampliación temporal (6 meses) de cuota para usuario 'luribe' y diagnóstico de inconsistencias en el sistema de archivos."
+
+# Bloque 284: Incidencia de conectividad remota
+nlp.data_embeddings$texto_para_ia[284] <- "Incidencia de acceso: error de 'Connection timed out' al intentar conectar vía SSH al cluster desde el extranjero. Consulta sobre posibles cambios en políticas de acceso o filtrado de IPs internacionales."
+
+# Bloque 285: Solicitud de gestión de cuentas (Convenio internacional)
+nlp.data_embeddings$texto_para_ia[285] <- "Solicitud administrativa: creación de cuenta de usuario con acceso al cluster para investigador externo (Convenio UNA-UChile) por periodo de 6 meses, prorrogable."
+
+# Bloque 286: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[286] <- "Solicitud de instalación de la herramienta bioinformática 'mdmcleaner' mediante canales bioconda."
+
+# Bloque 287: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[287] <- "Solicitud de instalación de la herramienta 'gunc' (Genome Taxonomy and Quality Check) vía bioconda."
+
+# Bloque 288: Incidencia de entorno (Rutas de ejecución)
+nlp.data_embeddings$texto_para_ia[288] <- "Incidencia técnica en 'tRNAscan-SE': error de ejecución por falta de dependencias externas ('cmsearch') a pesar de la carga de módulos. Conflicto de rutas en el entorno de ejecución."
+
+# Bloque 289: Incidencia de despliegue (Nextflow/Docker)
+nlp.data_embeddings$texto_para_ia[289] <- "Incidencia de ejecución en pipeline 'predector': fallos de despliegue al no encontrar dependencias (HMMER, deepredeff) y falta de soporte para entornos Docker en la configuración actual."
+
+# Bloque 290: Solicitud de entorno de desarrollo (Jupyter/Python)
+nlp.data_embeddings$texto_para_ia[290] <- "Solicitud de entorno de JupyterLab con despliegue de librerías especializadas (PyTorch, AFMReader, Scipy, Scikit-learn) para análisis de datos de fuerza atómica."
+
+# Bloque 291: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[291] <- "Solicitud de instalación de herramienta bioinformática no especificada."
+
+# Bloque 292: Incidencia de montaje de sistema de archivos
+nlp.data_embeddings$texto_para_ia[292] <- "Incidencia técnica: falla en el acceso a particiones 'work' y 'data'. Reporte de 'No existe el fichero o el directorio', sugiriendo un problema en el montaje de los sistemas de archivos para el perfil del usuario."
+
+# Bloque 293: Incidencia de acceso (Credenciales/SSH)
+nlp.data_embeddings$texto_para_ia[293] <- "Consulta administrativa: solicitud de información sobre el procedimiento correcto de conexión SSH al cluster, debido a la pérdida de la comunicación oficial de actualización."
+
+# Bloque 294: Incidencia de red (SCP)
+nlp.data_embeddings$texto_para_ia[294] <- "Incidencia técnica: error de 'Operation timed out' en comandos 'scp'. Problema de conectividad entre el cliente local y el cluster."
+
+# Bloque 295: Solicitud de ampliación de cuota ($HOME)
+nlp.data_embeddings$texto_para_ia[295] <- "Solicitud de ampliación de cuota en el directorio '$HOME' para habilitar el funcionamiento de la interfaz 'OnDemand'."
+
+# Bloque 296: Solicitud de instalación (Simulaciones CFD)
+nlp.data_embeddings$texto_para_ia[296] <- "Solicitud de instalación de software 'Fire Dynamics Simulator' (FDS) y 'Smokeview' (SMV) para simulaciones de dinámica de fluidos computacional (CFD)."
+
+# Bloque 297: Solicitud administrativa (Cuentas temporales)
+nlp.data_embeddings$texto_para_ia[297] <- "Solicitud administrativa: generación de cuentas temporales para curso académico en la UNA con privilegios en '$WORK' y '$HOME'."
+
+# Bloque 298: Solicitud de compilación personalizada
+nlp.data_embeddings$texto_para_ia[298] <- "Solicitud técnica: compilación de 'Quantum ESPRESSO' (QE) optimizada para aceleración por GPU."
+
+# Bloque 299: Solicitud de infraestructura (Bases de datos vectoriales)
+nlp.data_embeddings$texto_para_ia[299] <- "Solicitud de infraestructura: requerimiento de 'ChromaDB' y servicio de persistencia para almacenamiento de vectores de embeddings."
+
+# Bloque 300: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[300] <- "Solicitud de instalación de la herramienta 'COG' (Cluster of Orthologous Genes) para fines de investigación de posgrado."
+
+# Bloque 301: Incidencia de permisos (Escritura en sistema de archivos)
+nlp.data_embeddings$texto_para_ia[301] <- "Incidencia de permisos: reporte de 'Permission denied' al intentar transferir archivos hacia el clúster. Posible inconsistencia en los permisos de escritura del usuario sobre el directorio de destino."
+
+# Bloque 302: Solicitud de ampliación de cuota
+nlp.data_embeddings$texto_para_ia[302] <- "Solicitud de ampliación de cuota en 'work' (2TB adicionales) para almacenamiento y procesamiento de datasets de metagenómica."
+
+# Bloque 303: Incidencia técnica (Dependencia de PATH en Trinity)
+nlp.data_embeddings$texto_para_ia[303] <- "Incidencia técnica en 'Trinity v2.15.1': error de ejecución por incapacidad de localizar 'samtools'. Indica un problema en el cargado de módulos o en la definición de la variable de entorno 'PATH' durante el flujo de trabajo."
+
+# Bloque 304: Incidencia de conexión (Credenciales/DNS)
+nlp.data_embeddings$texto_para_ia[304] <- "Incidencia de acceso: error de 'Host not found' al intentar establecer conexión SSH. Posible problema de resolución de nombres DNS o configuración de red en el cliente del usuario."
+
+# Bloque 305: Incidencia de interfaz gráfica (Anvi'o/Navegador)
+nlp.data_embeddings$texto_para_ia[305] <- "Incidencia de rendimiento: incompatibilidad de renderizado en interfaces interactivas de 'Anvi'o' entre Firefox (lento) y Chrome (preferido). Consulta sobre la redirección de puertos y compatibilidad de navegadores web en el entorno 'OnDemand'."
+
+# Bloque 306: Incidencia de red (Firewall)
+nlp.data_embeddings$texto_para_ia[306] <- "Incidencia de conectividad: bloqueo de comandos 'git' hacia GitLab. Posible restricción de tráfico saliente por firewall institucional sobre los puertos de Git (SSH/HTTPS)."
+
+# Bloque 307: Solicitud de instalación (Pipeline metabólico)
+nlp.data_embeddings$texto_para_ia[307] <- "Solicitud de instalación de 'DRAM' (Distilled and Refined Annotation of Metabolism) incluyendo configuración de bases de datos de referencia (Prodigal, HMMER, BLAST)."
+
+# Bloque 308: Incidencia de asignación de recursos (SLURM)
+nlp.data_embeddings$texto_para_ia[308] <- "Incidencia técnica en SLURM: error de asignación de nodos ('Only allocated 1 nodes asked for X'). Indica una discrepancia entre la disponibilidad de recursos en la partición 'kura' y la solicitud del script."
+
+# Bloque 309: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[309] <- "Solicitud de instalación de 'SqueezeMeta' para flujos de trabajo metagenómicos integrales."
+
+# Bloque 310: Incidencia de ejecución (Dependencia de base de datos en dbCAN)
+nlp.data_embeddings$texto_para_ia[310] <- "Incidencia técnica en 'dbCAN': error de 'database directory does not exist'. El usuario requiere la descarga e instalación de las bases de datos de referencia para el funcionamiento correcto del módulo de búsqueda de CAZymes."
+
+# Bloque 311: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[311] <- "Solicitud de instalación de 'MetaEuk' para análisis de predicción de genes en metagenómica."
+
+# Bloque 312: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[312] <- "Solicitud de instalación de 'ASTRAL' para inferencia de filogenias de especies."
+
+# Bloque 313: Solicitud de actualización
+nlp.data_embeddings$texto_para_ia[313] <- "Solicitud de actualización de 'FastQC' de la v0.11.5 a la v0.12.1 para aprovechar mejoras funcionales."
+
+# Bloque 314: Solicitud de actualización
+nlp.data_embeddings$texto_para_ia[314] <- "Solicitud de actualización del software de ensamblaje 'Racon' a la versión más reciente."
+
+# Bloque 315: Incidencia de autenticación
+nlp.data_embeddings$texto_para_ia[315] <- "Incidencia de acceso: error de 'Permission denied' y 'Authentication failed' tras intentos de conexión. Reporte de posible bloqueo de seguridad en la cuenta de usuario."
+
+# Bloque 316: Solicitud de instalación compleja (Geant4)
+nlp.data_embeddings$texto_para_ia[316] <- "Solicitud de instalación de 'Geant4' con soporte para interfaz gráfica (Qt5), CMake y datasets de alta resolución, configurado para simulaciones en modo 'batch' y GUI."
+
+# Bloque 317: Solicitud de soporte técnico (Pipelines)
+nlp.data_embeddings$texto_para_ia[317] <- "Solicitud de soporte para ejecución de flujos de trabajo ('Companion' y pipelines 'nf-core') utilizando Nextflow o Docker."
+
+# Bloque 318: Solicitud de actualización y soporte GPU
+nlp.data_embeddings$texto_para_ia[318] <- "Solicitud de actualización de 'GROMACS' y 'Gnina' con soporte obligatorio para aceleración por GPU (CUDA) y cuDNN."
+
+# Bloque 319: Incidencia de ejecución (SLURM)
+nlp.data_embeddings$texto_para_ia[319] <- "Incidencia técnica en SLURM: el comando 'srun' no es reconocido al intentar inicializar sesiones interactivas en nodos específicos de la partición 'nukwa-debug'."
+
+# Bloque 320: Solicitud de actualización
+nlp.data_embeddings$texto_para_ia[320] <- "Solicitud de actualización del ensamblador 'IDBA' a la versión 1.1.3."
+
+# Bloque 321: Solicitud de actualización
+nlp.data_embeddings$texto_para_ia[321] <- "Solicitud de actualización del ensamblador 'MaSuRCA' a la versión v4.1.2."
+
+# Bloque 322: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[322] <- "Solicitud de instalación de 'SqueezeMeta' para flujos de trabajo metagenómicos."
+
+# Bloque 323: Incidencia de dependencias (Incompatibilidad de librerías)
+nlp.data_embeddings$texto_para_ia[323] <- "Incidencia técnica: conflicto de dependencias para simulaciones 'AIMD'. El software requiere la versión 1.8.x de la librería 'HDF5', la cual no está disponible en el entorno actual del clúster (solo existen versiones 1.10+)."
+
+# Bloque 324: Solicitud de instalación (Bioinformática)
+nlp.data_embeddings$texto_para_ia[324] <- "Solicitud de instalación de 'PlasmidFinder', incluyendo dependencias (Python 3, Biopython, BLAST+) y configuración de la base de datos de replicones."
+
+# Bloque 325: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[325] <- "Solicitud de instalación de la versión 'qiime2-2023.5' para análisis de microbiomas."
+
+# Bloque 326: Solicitud de ampliación de cuota
+nlp.data_embeddings$texto_para_ia[326] <- "Solicitud de ampliación de cuota en 'work' (20GB adicionales) para procesamiento de 12 muestras de metagenómica shotgun."
+
+# Bloque 327: Incidencia de gestión de archivos (Permisos de borrado)
+nlp.data_embeddings$texto_para_ia[327] <- "Solicitud de asistencia técnica: el usuario requiere limpiar directorios específicos ('ASGARD', 'Maiz_Melany', 'miniconda3') en su espacio 'work' debido a falta de permisos de borrado."
+
+# Bloque 328: Solicitud de instalación (Simulación Química)
+nlp.data_embeddings$texto_para_ia[328] <- "Solicitud de instalación de los paquetes de software científico 'Quantum ESPRESSO' y 'NChem' para simulaciones químicas."
+
+# Bloque 329: Incidencia de entorno (Gestión de paquetes R)
+nlp.data_embeddings$texto_para_ia[329] <- "Incidencia técnica: solicitud de instalación de múltiples paquetes de R ('gsw', 'raster', 'sf', etc.) que no están disponibles en los módulos actuales. El usuario presenta dificultades con la instalación local en su espacio de usuario."
+
+# Bloque 330: Solicitud de instalación (Dependencias estadísticas)
+nlp.data_embeddings$texto_para_ia[330] <- "Solicitud de instalación de la librería R 'Rglpk' y sus dependencias del sistema ('glpk-devel', 'gmp-devel') para modelado estadístico."
+
+# Bloque 331: Incidencia de almacenamiento y cuotas
+nlp.data_embeddings$texto_para_ia[331] <- "Incidencia técnica: posibles fallos en el ensamblador 'MaSuRCA' por saturación de espacio en el sistema de archivos. Solicitud de verificación de cuota y ampliación."
+
+# Bloque 332: Incidencia de dependencias (Incompatibilidad ABI/GLIBCXX)
+nlp.data_embeddings$texto_para_ia[332] <- "Incidencia técnica: inconsistencia de librerías dinámicas (GLIBCXX, libjasper, libnetcdf) entre el nodo de login y los nodos de cómputo ('kura'). Se requiere una estandarización de las dependencias del sistema."
+
+# Bloque 333: Incidencia de persistencia de sesión (RStudio Server)
+nlp.data_embeddings$texto_para_ia[333] <- "Incidencia de estabilidad: desconexión prematura de 'RStudio Server' por inactividad y pérdida de trabajos en ejecución al reconectar. Consulta sobre la configuración de persistencia de procesos."
+
+# Bloque 334: Incidencia de ejecución paralela (SLURM)
+nlp.data_embeddings$texto_para_ia[334] <- "Incidencia técnica en procesamiento distribuido R: interrupción del job debido a la reasignación dinámica de nodos por parte de SLURM. Consulta sobre la persistencia de la topología de nodos asignados."
+
+# Bloque 335: Solicitud de ampliación de cuota
+nlp.data_embeddings$texto_para_ia[335] <- "Solicitud de ampliación de cuota en 'work' para el Laboratorio de Genómica del CENIBiot."
+
+# Bloque 336: Solicitud de actualización
+nlp.data_embeddings$texto_para_ia[336] <- "Solicitud de actualización del software de ensamblaje 'MaSuRCA' a la versión v4.1.3."
+
+# Bloque 337: Incidencia de permisos (ACL/NFSv4)
+nlp.data_embeddings$texto_para_ia[337] <- "Incidencia de acceso: bloqueo del usuario en directorio propio tras error en la gestión de permisos 'nfs4_setfacl' durante una colaboración externa."
+
+# Bloque 338: Incidencia de red (Connection refused)
+nlp.data_embeddings$texto_para_ia[338] <- "Incidencia de acceso: error de 'Connection refused' al intentar conexión SSH, indicando posible indisponibilidad del servicio en el puerto configurado."
+
+# Bloque 339: Incidencia de acceso (Dashboard)
+nlp.data_embeddings$texto_para_ia[339] <- "Incidencia de acceso: falla en el ingreso al Dashboard ('Connection refused'), impidiendo el uso de la terminal web del cluster."
+
+# Bloque 340: Solicitud de actualización (Suite Kraken)
+nlp.data_embeddings$texto_para_ia[340] <- "Solicitud de actualización de la suite metagenómica: 'Krakentools', 'Kraken2', 'Krona' y 'Bracken' a sus versiones más recientes."
+
+# Bloque 341: Solicitud de entorno de compilación (SWAT+)
+nlp.data_embeddings$texto_para_ia[341] <- "Solicitud técnica: actualización de toolchain ('gfortran' >= 9.0, 'cmake' >= 3.13) o compilación del software 'SWAT+ r61.2' para corregir errores de ejecución en scripts meteorológicos."
+
+# Bloque 342: Solicitud administrativa (Cuenta y cuota)
+nlp.data_embeddings$texto_para_ia[342] <- "Solicitud administrativa: creación de cuenta de usuario con 400GB de almacenamiento en 'work' para colaboración internacional (proyecto transcriptómica, duración 2 años)."
+
+# Bloque 343: Incidencia de entorno (Conflictos de módulos)
+nlp.data_embeddings$texto_para_ia[343] <- "Incidencia técnica en 'Unicycler' y 'Pilon': error de ejecución por carga redundante o incorrecta de módulos Conda."
+
+# Bloque 344: Incidencia de entorno (Python venv en SLURM)
+nlp.data_embeddings$texto_para_ia[344] <- "Incidencia técnica en SLURM: falla en la detección de dependencias de Python instaladas en un 'virtualenv'. El script de trabajo no activa correctamente el entorno, resultando en 'ModuleNotFoundError'."
+
+# Bloque 345: Incidencia de hardware (Driver NVIDIA)
+nlp.data_embeddings$texto_para_ia[345] <- "Incidencia crítica de infraestructura: falla en la comunicación con drivers NVIDIA en nodos 'nukwa-v100'. El comando 'nvidia-smi' falla, impidiendo el uso de aceleración por GPU."
+
+# Bloque 346: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[346] <- "Solicitud de instalación de herramienta bioinformática no especificada."
+
+# Bloque 347: Consulta de arquitectura (Contenedores)
+nlp.data_embeddings$texto_para_ia[347] <- "Consulta técnica: viabilidad de ejecutar herramientas empaquetadas en Docker o flujos de trabajo de análisis de variantes en hongos."
+
+# Bloque 348: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[348] <- "Solicitud de instalación de 'IQ-TREE 3' para análisis filogenéticos."
+
+# Bloque 349: Incidencia de configuración (SLURM)
+nlp.data_embeddings$texto_para_ia[349] <- "Incidencia técnica: error en el envío de jobs ('Job submit failed: No partition specified'). El usuario requiere orientación sobre cómo configurar la partición por defecto en el comando 'salloc'."
+
+# Bloque 350: Incidencia de entorno (Gestión de librerías Python)
+nlp.data_embeddings$texto_para_ia[350] <- "Incidencia técnica en Python: error 'ModuleNotFoundError: numpy' en scripts SLURM. Consulta sobre la forma correcta de gestionar librerías (instalación local vs. módulos del sistema)."
+
+# Bloque 351: Solicitud de actualización
+nlp.data_embeddings$texto_para_ia[351] <- "Solicitud de actualización de 'Nextflow' a la versión 25.04.6 para cumplir con los requisitos mínimos de versión de un pipeline específico."
+
+# Bloque 352: Solicitud de entorno (Kernel OnDemand)
+nlp.data_embeddings$texto_para_ia[352] <- "Solicitud de instalación de paquetes 'gdown' y 'unzip' en el kernel 'Python-ML-DL' de Jupyter (OnDemand)."
+
+# Bloque 353: Solicitud de entorno (Kernel OnDemand)
+nlp.data_embeddings$texto_para_ia[353] <- "Solicitud de instalación del paquete 'segment-geospatial' en el kernel 'Python-ML-DL' de Jupyter (OnDemand)."
+
+# Bloque 354: Incidencia técnica (Intermitencia en herramientas)
+nlp.data_embeddings$texto_para_ia[354] <- "Incidencia técnica en 'VirSorter': comportamiento inconsistente ('error intermitente') al procesar archivos distintos con la misma configuración."
+
+# Bloque 355: Incidencia de autenticación
+nlp.data_embeddings$texto_para_ia[355] <- "Incidencia de acceso: usuario requiere restablecer contraseña de cuenta de usuario tras falla en validación de credenciales."
+
+# Bloque 356: Incidencia de entorno (HybPiper/MKL)
+nlp.data_embeddings$texto_para_ia[356] <- "Incidencia técnica en 'HybPiper': falla por dependencias obsoletas de Python y errores de inicialización de librerías Intel MKL ('mkl-service'). Se requiere actualización global de entorno."
+
+# Bloque 357: Solicitud de actualización
+nlp.data_embeddings$texto_para_ia[357] <- "Solicitud de actualización de 'Qiime2' (versión 2025.7) y 'MOSHPIT' para flujos de análisis de amplicones."
+
+# Bloque 358: Solicitud de actualización
+nlp.data_embeddings$texto_para_ia[358] <- "Solicitud de actualización de 'SPAdes' de la versión 3.15.4 a la 4.2.0."
+
+# Bloque 359: Solicitud de actualización
+nlp.data_embeddings$texto_para_ia[359] <- "Solicitud de actualización de 'MEGAHIT' de la versión 1.1.2 a la 1.2.9."
+
+# Bloque 360: Incidencia de permisos (Nextflow/.nextflow)
+nlp.data_embeddings$texto_para_ia[360] <- "Incidencia técnica en 'nf-core/Nextflow': error de 'Permiso denegado' al intentar escribir en el archivo oculto '.nextflow' dentro del directorio de trabajo. Incidencia ligada a permisos de escritura del usuario en rutas compartidas."
+
+# Bloque 361: Incidencia de acceso inicial
+nlp.data_embeddings$texto_para_ia[361] <- "Incidencia de acceso: usuario nuevo reporta falla de conectividad (ping) y consulta por atención presencial para configurar su primer acceso al clúster."
+
+# Bloque 362: Solicitud de ampliación de cuota y arquitectura de almacenamiento
+nlp.data_embeddings$texto_para_ia[362] <- "Solicitud de ampliación de cuota en 'data' para procesamiento de 75 muestras metagenómicas (archivos SAM de gran tamaño). Consulta técnica sobre las mejores prácticas de I/O y particiones de almacenamiento para análisis genómicos eucariotas."
+
+# Bloque 363: Solicitud de entorno (Kernel OnDemand)
+nlp.data_embeddings$texto_para_ia[363] <- "Solicitud de instalación de paquete de software en el kernel 'Python-ML-DL' de Jupyter (OnDemand)."
+
+# Bloque 364: Solicitud de creación de entorno personalizado (Mamba/FlashInfer)
+nlp.data_embeddings$texto_para_ia[364] <- "Solicitud técnica: clonación y personalización de módulo 'mamba 0.10.1.1' para incluir la librería 'flashinfer' (optimización para inferencia de modelos de lenguaje)."
+
+# Bloque 365: Incidencia técnica (Librerías dinámicas/EMBOSS)
+nlp.data_embeddings$texto_para_ia[365] <- "Incidencia técnica en 'backtranseq' (EMBOSS): error de ejecución 'cannot open shared object file: libimf.so'. Indica una inconsistencia en las rutas de librerías del compilador Intel (Math Kernel Library) en el perfil del usuario."
+
+# Bloque 366: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[366] <- "Solicitud de instalación de suite filogenética: 'BEAST v1.10.5', 'BEAST2 v2.7.8' y 'RevBayes v1.3.0'."
+
+# Bloque 367: Consulta técnica (BLAST+)
+nlp.data_embeddings$texto_para_ia[367] <- "Consulta técnica sobre el uso de 'BLAST+': el usuario requiere información sobre la disponibilidad de bases de datos locales precargadas en el clúster, dado que el acceso remoto a servidores externos está restringido por seguridad."
+
+# Bloque 368: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[368] <- "Solicitud de instalación de herramienta de análisis bioinformático no especificada."
+
+# Bloque 369: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[369] <- "Solicitud de instalación del módulo 'RAxML-NG' para análisis de máxima verosimilitud en filogenia."
+
+# Bloque 370: Incidencia técnica (NAMD/CUDA)
+nlp.data_embeddings$texto_para_ia[370] <- "Incidencia técnica en 'NAMD3': error de 'Unknown command-line option +devices'. Consulta sobre la compilación actual del software y la disponibilidad de una versión con soporte nativo para aceleración por GPU (CUDA)."
+
+# Bloque 371: Solicitud de ampliación de cuota
+nlp.data_embeddings$texto_para_ia[371] <- "Solicitud de ampliación de cuota (~350GB) para usuario de doctorado en la UNA (proyecto de transcriptómica)."
+
+# Bloque 372: Solicitud de ampliación de cuota
+nlp.data_embeddings$texto_para_ia[372] <- "Solicitud de incremento de 500GB en el directorio 'data' para finalizar experimentos de investigación."
+
+# Bloque 373: Solicitud de ampliación de cuota
+nlp.data_embeddings$texto_para_ia[373] <- "Solicitud de incremento a 250GB en el directorio de usuario para permitir la transferencia y procesamiento de secuencias crudas de ADN."
+
+# Bloque 374: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[374] <- "Solicitud de instalación de herramienta bioinformática (especificaciones en enlace adjunto)."
+
+# Bloque 375: Incidencia de entorno (Nextflow/Conda)
+nlp.data_embeddings$texto_para_ia[375] <- "Incidencia técnica: falla en la creación automática de entornos Conda durante la ejecución del pipeline 'nf-LO'. Solicitud de instalación global de 'Nextflow' para evitar errores de autodespliegue."
+
+# Bloque 376: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[376] <- "Solicitud de instalación del módulo 'BEAGLE v4.0' para análisis de verosimilitud en filogenética."
+
+# Bloque 377: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[377] <- "Solicitud de instalación de 'CAPTUS' para análisis filogenómicos."
+
+# Bloque 378: Solicitud de ampliación de cuota (IA/Ollama)
+nlp.data_embeddings$texto_para_ia[378] <- "Solicitud de ampliación de 400GB en 'data' para el despliegue de 10 modelos de IA mediante 'Ollama' en investigación de la UCR."
+
+# Bloque 379: Incidencia de entorno (Mamba vs Miniconda)
+nlp.data_embeddings$texto_para_ia[379] <- "Incidencia técnica: inconsistencia en la ejecución de flujos de trabajo al migrar de 'Miniconda' a 'Mamba'. Reporte de falla de compatibilidad en la resolución de dependencias."
+
+# Bloque 380: Solicitud de ampliación de cuota
+nlp.data_embeddings$texto_para_ia[380] <- "Solicitud de incremento de almacenamiento para estudiante de maestría (CENIBiot), justificado por la necesidad de procesar múltiples sets de datos genómicos/transcriptómicos."
+
+# Bloque 381: Incidencia de ejecución paralela (Delft3D-FM/MPI)
+nlp.data_embeddings$texto_para_ia[381] <- "Incidencia técnica en 'Delft3D-FM': falla en la ejecución paralela mediante MPI. El usuario requiere revisión de la configuración de hilos y comunicación entre nodos en el script de SLURM."
+
+# Bloque 382: Solicitud de ampliación de cuota
+nlp.data_embeddings$texto_para_ia[382] <- "Solicitud de ampliación de cuota (300-400GB) para manejar archivos colaterales generados por el pipeline 'CAPTUS' en genómica de plantas."
+
+# Bloque 383: Solicitud de ampliación de cuota (Temporal/Proyecto FEES)
+nlp.data_embeddings$texto_para_ia[383] <- "Solicitud de ampliación temporal (1TB por 2 meses) en 'work' para el ensamblaje de genomas mediante 'MaSuRCA', validado por proyecto FEES vigente."
+
+# Bloque 384: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[384] <- "Solicitud de instalación de herramienta bioinformática no especificada y descarga de sus bases de datos requeridas."
+
+# Bloque 385: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[385] <- "Solicitud de instalación de software desde repositorio GitLab."
+
+# Bloque 386: Solicitud de ampliación de cuota
+nlp.data_embeddings$texto_para_ia[386] <- "Solicitud de ampliación de cuota a 2TB para usuario 'dxie', requerido para experimentos de procesamiento de imágenes con fecha límite de envío de artículo científico."
+
+# Bloque 387: Solicitud de ampliación de cuota (Escalado)
+nlp.data_embeddings$texto_para_ia[387] <- "Solicitud de ampliación de cuota a 4TB para usuario 'dxie' debido a insuficiente capacidad en el incremento previo."
+
+# Bloque 388: Solicitud de almacenamiento masivo
+nlp.data_embeddings$texto_para_ia[388] <- "Solicitud de 10TB de almacenamiento para un dataset de tesis de maestría. Consulta sobre la disponibilidad de almacenamiento en particiones de login."
+
+# Bloque 389: Solicitud de actualización
+nlp.data_embeddings$texto_para_ia[389] <- "Solicitud de actualización del software 'Cactus' a la versión 3.0.1."
+
+# Bloque 390: Solicitud de instalación (OpenFOAM)
+nlp.data_embeddings$texto_para_ia[390] <- "Solicitud de instalación de la suite 'OpenFOAM v13' mediante compilación desde código fuente."
+
+# Bloque 391: Incidencia de entorno (Inconsistencia entre particiones)
+nlp.data_embeddings$texto_para_ia[391] <- "Incidencia técnica: comportamiento inconsistente del software ('Salmon', 'Samtools') entre las particiones 'kura' y 'dribe'. Indica una posible desincronización en la instalación de librerías del sistema o parches entre nodos de cómputo."
+
+# Bloque 392: Incidencia de entorno (Permisos y librerías en R)
+nlp.data_embeddings$texto_para_ia[392] <- "Incidencia técnica en 'R': error de inicio por falta de acceso ('Permission denied') a archivos de configuración/librerías base ('utils', 'stats'). Incluye reporte de falla en 'RStudio Server' (OnDemand) y solicitud de despliegue de paquetes para análisis de redes (igraph, ggraph, statnet)."
+
+# Bloque 392: Incidencia de entorno en R
+nlp.data_embeddings$texto_para_ia[392] <- "Incidencia técnica en 'R': error de inicio por falta de acceso ('Permission denied') a archivos de configuración/librerías base ('utils', 'stats'). Incluye reporte de falla en 'RStudio Server' (OnDemand) y solicitud de despliegue de paquetes para análisis de redes (igraph, ggraph, statnet)."
+
+# Bloque 393: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[393] <- "Solicitud de instalación de herramienta bioinformática no especificada."
+
+# Bloque 394: Incidencia técnica (Dependencias dinámicas en FastANI)
+nlp.data_embeddings$texto_para_ia[394] <- "Incidencia técnica en 'fastANI': error de ejecución por falta de librería compartida 'libgsl.so.0'. Indica una inconsistencia entre la versión instalada del software y las dependencias de la GNU Scientific Library (GSL) en el entorno del clúster."
+
+# Bloque 395: Incidencia de red (Restricciones de salida/Proxy)
+nlp.data_embeddings$texto_para_ia[395] <- "Incidencia técnica: falla de conexión en comandos 'pip install' tanto en nodos de login como de cómputo ('Name or service not known'). El error indica que el entorno no tiene acceso a internet o no tiene configurado el proxy necesario para resolver nombres de dominio externos."
+
+# Bloque 396: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[396] <- "Solicitud de instalación de 'featureCounts' (perteneciente a la suite 'Subread') para cuantificación de lecturas de secuenciación."
+
+# Bloque 397: Solicitud de instalación (Benchmarking)
+nlp.data_embeddings$texto_para_ia[397] <- "Solicitud de instalación de 'ReFrame v4.7.4', un framework especializado en pruebas de rendimiento (benchmarking) y validación de sistemas HPC."
+
+# Bloque 398: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[398] <- "Solicitud de instalación del módulo 'BEAST v1.10.4' para análisis filogenéticos y evolutivos."
+
+# Bloque 399: Incidencia de acceso general (Consola y OnDemand)
+nlp.data_embeddings$texto_para_ia[399] <- "Incidencia crítica de acceso: el usuario reporta imposibilidad total de autenticación tanto vía consola (SSH) como a través de la interfaz web (OnDemand), sugiriendo un posible bloqueo de cuenta, error en el servicio de autenticación (LDAP/AD) o vencimiento de credenciales."
+
+# Bloque 400: Incidencia técnica (Deep Learning/GPU)
+nlp.data_embeddings$texto_para_ia[400] <- "Incidencia técnica crítica: fallo en la detección de GPU (CUDA) en un entorno Conda configurado para 'PyTorch' y 'Unsloth'. A pesar de que 'nvidia-smi' reconoce el hardware, el framework de Deep Learning no vincula correctamente las librerías CUDA, resultando en 'NotImplementedError'. Se requiere depuración de la compatibilidad entre el driver del sistema, el toolkit CUDA y la versión de PyTorch instalada."
+
+# Bloque 401: Solicitud de ampliación de cuota
+nlp.data_embeddings$texto_para_ia[401] <- "Solicitud de ampliación de cuota (100GB) en el espacio 'work' para realizar ensamblajes de secuencias de ADN correspondientes a una tesis de grado."
+
+# Bloque 402: Solicitud de ampliación de cuota masiva (1TB)
+nlp.data_embeddings$texto_para_ia[402] <- "Solicitud de ampliación de cuota a 1TB en el espacio 'work' para el ensamblaje de genomas de plantas mediante 'Trinity'. El proceso actual falla por saturación de disco debido a la generación masiva de archivos intermedios."
+
+# Bloque 403: Incidencia técnica (Gmsh/OpenCASCADE)
+nlp.data_embeddings$texto_para_ia[403] <- "Incidencia técnica en 'Gmsh': error durante el mallado por falta de vinculación con 'OpenCASCADE'. Se requiere una re-compilación del software con las librerías de geometría externa correctamente detectadas y habilitadas."
+
+# Bloque 404: Solicitud de actualización
+nlp.data_embeddings$texto_para_ia[404] <- "Solicitud de instalación de la última versión de 'QIIME 2 2026.1' para flujos de trabajo de análisis de amplicones."
+
+# Bloque 405: Solicitud de ampliación de cuota (IA/Models)
+nlp.data_embeddings$texto_para_ia[405] <- "Solicitud de ampliación de cuota (50GB) en el espacio de usuario 'aobando' para la instalación de librerías de Deep Learning ('transformers', 'bitsandbytes', etc.) y almacenamiento de datasets para tesis de maestría."
+
+# Bloque 406: Solicitud de almacenamiento masivo (Sismología/2.5TB)
+nlp.data_embeddings$texto_para_ia[406] <- "Solicitud de ampliación de cuota a 2.5TB en 'data' para el usuario 'murbina'. El espacio es requerido para el almacenamiento y procesamiento masivo de registros sísmicos continuos (formato MiniSEED) provenientes de 70 nodos del OVSICORI."
+
+# Bloque 407: Solicitud de acceso a directorio compartido
+nlp.data_embeddings$texto_para_ia[407] <- "Solicitud de acceso al directorio compartido 'plasmatec' para la colaboración interinstitucional (TEC) en investigación sobre plasmas."
+
+# Bloque 408: Solicitud de instalación
+nlp.data_embeddings$texto_para_ia[408] <- "Solicitud de instalación de la herramienta 'Evo2' (modelado genómico) desde el repositorio oficial de GitHub."
+
+# Bloque 409: Solicitud de instalación (Dinámica Molecular/GPU)
+nlp.data_embeddings$texto_para_ia[409] <- "Solicitud de instalación de la suite 'AMBER' con soporte para aceleración por GPU ('pmemd.cuda'). Se requiere la versión 'AmberTools25' + 'pmemd24' con compatibilidad para CUDA 11.8/12.x."
+
+# Bloque 410: Incidencia técnica (Compatibilidad CUDA/PyTorch)
+nlp.data_embeddings$texto_para_ia[410] <- "Incidencia técnica: solicitud de actualización del toolkit CUDA para garantizar la compatibilidad con 'PyTorch >= 2.8' y la librería 'Torchao'. El usuario requiere un entorno de ejecución actualizado para aprovechar las nuevas funcionalidades de optimización en modelos de Deep Learning."
+
+# Bloque 411: Solicitud de configuración de entorno (Geociencias/Análisis Espacial)
+nlp.data_embeddings$texto_para_ia[411] <- "Solicitud de asistencia técnica para la creación de un entorno de Python con librerías especializadas ('xarray', 'eof', 'geopandas', 'regionmask') para análisis de datos geocientíficos."
+
+# Bloque 412: Solicitud de ampliación temporal (Metagenómica/2TB)
+nlp.data_embeddings$texto_para_ia[412] <- "Solicitud de ampliación temporal (2TB por 2 meses) en 'work' para la ejecución del pipeline 'nfcore-mag' (metagenómica shotgun) vinculado al proyecto FIDA/UNA sobre remediación ambiental."
+
+# Bloque 413: Solicitud de ampliación de cuota (Pangenómica/300GB)
+nlp.data_embeddings$texto_para_ia[413] <- "Solicitud de ampliación de 300GB en el espacio de usuario para el manejo de ~200GB de datos genómicos en un proyecto de pangenoma del género 'Rhynchospora'."
+
+# Bloque 414: Solicitud de ampliación de cuota (Metagenómica Ambiental/3TB)
+nlp.data_embeddings$texto_para_ia[414] <- "Solicitud de ampliación de 3TB adicionales en 'data' para un investigador del CENIBiot especializado en genómica ambiental, debido al gran volumen de archivos de secuenciación shotgun."
+
+# Bloque 415: Solicitud de ampliación de cuota (Metagenómica/1TB)
+nlp.data_embeddings$texto_para_ia[415] <- "Solicitud de incremento de almacenamiento (hasta 1TB) en 'data' para el análisis de muestras de metagenómica del INISA (UCR)."
+
+# Bloque 416: Solicitud de ampliación temporal (Publicación científica)
+nlp.data_embeddings$texto_para_ia[416] <- "Solicitud de ampliación temporal (100-150GB) para finalizar el procesamiento de datos requerido para una publicación científica en 'CARLA' (Conferencia Latinoamericana de Computación de Alto Rendimiento)."
+
+# Bloque 417: Incidencia de permisos (Acceso a directorios/NFS)
+nlp.data_embeddings$texto_para_ia[417] <- "Incidencia técnica: pérdida de permisos de acceso en directorio compartido. El usuario puede ingresar al nivel superior pero no tiene privilegios de lectura o listado sobre los subdirectorios, sugiriendo un error de consistencia en el servidor de archivos (NFS/ACLs)."
+
+# Bloque 418: Incidencia de permisos (NFSv4 ACLs)
+nlp.data_embeddings$texto_para_ia[418] <- "Incidencia técnica: falla en la aplicación de permisos mediante 'nfs4_setfacl' (error 'Operation to request attribute not supported'). Indica una incompatibilidad entre el sistema de archivos del clúster y el protocolo de control de acceso extendido."
+
+# Bloque 419: Incidencia técnica (Falla de detección de GPU en ejecución)
+nlp.data_embeddings$texto_para_ia[419] <- "Incidencia técnica crítica: 'RuntimeError: No CUDA GPUs are available' durante la ejecución de un entrenamiento en 'nukwa-10'. El software no logra vincular con la GPU a pesar de que el proceso ha sido lanzado, indicando una posible falla en el nodo o una desconexión del driver CUDA."
+
+readr::write_csv(nlp.data_embeddings, "data.csv")
+```
+
+
+paso python embedding
+
+```{r}
+library(tidyverse)
+library(uwot)      # Para reducir dimensiones (UMAP)
+library(ggplot2)   # Para graficar
+library(factoextra) # Para ayudar con la visualización del clustering
+
+matriz_raw <- read.csv("matriz_limpia.csv")
+matriz_final <- as.matrix(matriz_raw)
+dim(matriz_final)
+```
+
+```{r}
+# 1. Reducción de dimensiones con UMAP
+set.seed(42)
+umap_results <- umap(matriz_final, n_neighbors = 15, min_dist = 0.1, n_components = 2)
+
+# 2. Convertir a un dataframe para visualización
+df_umap <- as.data.frame(umap_results)
+colnames(df_umap) <- c("UMAP1", "UMAP2")
+
+# 3. Visualización pura (sin agrupamiento por clusters)
+pdf("umap_embeddings.pdf", width = 7, height = 5)
+
+ggplot(df_umap, aes(x = UMAP1, y = UMAP2)) +
+  geom_point(alpha = 0.6, size = 3, color = "steelblue") +
+  
+  theme_classic() +
+  
+  labs(
+    x = "UMAP1",
+    y = "UMAP2"
+  )
+
+dev.off()
+```
+
