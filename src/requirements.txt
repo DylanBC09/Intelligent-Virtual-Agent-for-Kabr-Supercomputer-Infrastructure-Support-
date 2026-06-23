@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pandas
+scikit-learn
+torch
+transformers
+google-generativeai
+email-validator
