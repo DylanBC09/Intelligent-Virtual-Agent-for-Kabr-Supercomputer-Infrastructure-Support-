@@ -66,7 +66,7 @@ def enviar_correo_infraestructura(user_id, correo_usuario, contexto):
     ).text
 
     remitente = "benavidescastillo06@gmail.com"
-    password = "nyumwzdxhtnosggx"
+    password = "password"
     destinatario = "dbenavides@cenat.ac.cr"
 
     msg = MIMEMultipart()
